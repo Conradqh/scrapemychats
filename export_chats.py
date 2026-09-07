@@ -15,6 +15,8 @@ Usage:
     python export_chats.py --limit 3      # small test run first (recommended)
     python export_chats.py --csv my.csv   # export a specific list instead
     python export_chats.py --rediscover   # refresh chats.csv from the account
+    python export_chats.py --projects "My Project"   # only that Project's chats
+    python export_chats.py --no-files      # conversation text only, no downloads
 
 The chat list is saved to chats.csv on first run and reused afterwards, so
 folder numbering stays stable. Re-running skips chats already exported —
@@ -177,7 +179,7 @@ def discover_main(page, headers):
     ]
 
 
-def discover_projects(page, headers):
+def discover_projects(page, headers, names=None):
     """Enumerate Projects and every conversation inside each of them."""
     projects, cursor = [], None
     while True:
@@ -201,6 +203,13 @@ def discover_projects(page, headers):
         if not cursor or not data.get("items"):
             break
         time.sleep(random.uniform(1, 2))
+
+    if names:
+        wanted = [n.lower() for n in names]
+        log(f"  projects found: {[n for _, n in projects]}")
+        projects = [(gid, name) for gid, name in projects
+                    if any(w in name.lower() for w in wanted)]
+        log(f"  matched {len(projects)} project(s): {[n for _, n in projects]}")
 
     chats = []
     for gid, name in projects:
@@ -700,6 +709,14 @@ def main():
     ap.add_argument("--rediscover", action="store_true",
                     help="refresh chats.csv from the account before exporting "
                          "(new chats are appended; existing rows keep their order)")
+    ap.add_argument("--projects", nargs="+", metavar="NAME",
+                    help="export only chats inside the named Project(s) "
+                         "(case-insensitive substring match); skips the main "
+                         "sidebar and does not read or write chats.csv")
+    ap.add_argument("--no-files", action="store_true",
+                    help="export conversation text only; skip all attachment, "
+                         "generated-file, and Library downloads (fast; avoids "
+                         "download rate limits)")
     ap.add_argument("--fix-files", action="store_true",
                     help="don't re-export conversations; instead revisit every "
                          "already-exported chat and fetch any missing attachments, "
@@ -753,9 +770,24 @@ def main():
             log("fix-files pass complete.")
             return
 
-        if args.rediscover or not args.csv.exists():
-            discover_chats(page, args.csv)
-        chats = read_chat_list(args.csv)
+        if args.projects:
+            headers = capture_auth(page)
+            log(f"Discovering conversations in project(s): {args.projects}")
+            found = discover_projects(page, headers, names=args.projects)
+            chats, seen = [], set()
+            for url, cid, title in found:
+                if cid not in seen:
+                    seen.add(cid)
+                    chats.append((url, cid, title))
+            if not chats:
+                log("No conversations matched the given project name(s) — see "
+                    "the available project list above. Nothing to export.")
+                context.close()
+                return
+        else:
+            if args.rediscover or not args.csv.exists():
+                discover_chats(page, args.csv)
+            chats = read_chat_list(args.csv)
         if args.limit:
             chats = chats[: args.limit]
         log(f"{len(chats)} chats to process")
@@ -823,7 +855,7 @@ def main():
                 refs = collect_file_refs(data)
                 srefs = collect_sandbox_refs(data)
                 f_ok = f_fail = 0
-                if refs or srefs:
+                if not args.no_files and (refs or srefs):
                     log(f"    {len(refs)} file(s) + {len(srefs)} generated file(s), downloading...")
                     f_ok, f_fail = download_files(
                         page, context, refs, folder / "files", auth, err
@@ -855,7 +887,8 @@ def main():
             ramp = min(RAMP_CAP, (made // RAMP_EVERY) * RAMP_STEP)
             time.sleep(random.uniform(*DELAY_RANGE) + max(extra_delay, ramp))
 
-        library_sweep(page, context, args.out, auth, gerr)
+        if not args.no_files:
+            library_sweep(page, context, args.out, auth, gerr)
         context.close()
 
     log("")
