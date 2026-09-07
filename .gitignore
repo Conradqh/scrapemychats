@@ -1,5 +1,7 @@
 # your exported data — never commit this
 export/
+export_projects/
+export_projects_split/
 chats*.csv
 manifest.csv
 categories.json

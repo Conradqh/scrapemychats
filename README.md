@@ -63,6 +63,23 @@ The chat list is discovered automatically (including chats inside
 Projects) and saved to `chats.csv`. Alternatively supply your own list
 with `--csv mylist.csv` (first column: chat URL, second: title).
 
+To export only specific Projects, name them:
+
+    python export_chats.py --projects "Project A" "Project B"
+
+The match is case-insensitive and partial. This skips the main sidebar and
+does not touch chats.csv. Tip: use a separate output folder, e.g.
+`--out export_projectA`, to keep a project-only export apart from a full one.
+
+For text only, skip all file downloads:
+
+    python export_chats.py --no-files
+
+This writes each conversation's JSON and Markdown but downloads no
+attachments, generated files, or Library files. It is much faster and
+avoids the download rate limits. The Markdown still lists attachment
+names inline, so you keep the full context.
+
 ---
 
 ## Never used a terminal? Start here
