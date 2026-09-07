@@ -53,6 +53,9 @@ MAX_ATTEMPTS = 3
 RATE_LIMIT_BACKOFFS_S = [300, 600, 900, 1800, 1800]
 LONG_BREAK_EVERY = 20  # chats
 LONG_BREAK_S = (150, 240)
+RAMP_STEP = 4.0    # seconds added to each inter-chat delay per RAMP_EVERY processed chats
+RAMP_EVERY = 10
+RAMP_CAP = 45.0
 
 
 def log(msg):
@@ -665,18 +668,22 @@ def fix_files(page, context, out_dir, auth, ef):
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
-    with page.expect_response(
-        lambda r: f"/backend-api/conversation/{cid}" in r.url
-        and r.request.method == "GET",
-        timeout=NAV_TIMEOUT_MS,
-    ) as resp_info:
-        page.goto(url, wait_until="domcontentloaded")
-    resp = resp_info.value
-    if resp.status != 200:
-        return None, None, resp.status
-    return resp.json(), auth_headers_from(resp.request.headers), 200
+def capture_conversation(page, cid, auth):
+    """Fetch the full conversation JSON directly from the backend using the
+    frontend's own session headers. Returns (data, status, note). data is None
+    unless the body is a real conversation (a mapping dict plus current_node);
+    note is a short body snippet for logging on failure."""
+    res = fetch_with_session(page, f"{BASE_URL}/backend-api/conversation/{cid}", auth)
+    status, body = res["status"], res["body"] or ""
+    if status != 200:
+        return None, status, body[:200]
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None, "unparseable", body[:200]
+    if not (isinstance(data.get("mapping"), dict) and data.get("current_node")):
+        return None, "invalid", body[:200]
+    return data, 200, ""
 
 
 def main():
@@ -752,7 +759,8 @@ def main():
         if args.limit:
             chats = chats[: args.limit]
         log(f"{len(chats)} chats to process")
-        last_auth = None
+        auth = capture_auth(page)
+        made = 0
 
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
@@ -765,11 +773,11 @@ def main():
                 ef.flush()
 
             log(f"[{i}/{len(chats)}] {title}")
-            data = auth = None
+            data = None
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid)
+                    data, status, note = capture_conversation(page, cid, auth)
                     if status == 200:
                         break
                     if status in (429, 403):
@@ -782,8 +790,14 @@ def main():
                         log(f"    rate limited (HTTP {status}), cooling down {wait // 60} min...")
                         time.sleep(wait)
                         continue
+                    if status == 401:
+                        log("    auth expired, refreshing session headers...")
+                        auth = capture_auth(page)
+                        attempt += 1
+                        time.sleep(5)
+                        continue
                     attempt += 1
-                    err(f"conversation HTTP {status} (attempt {attempt})")
+                    err(f"conversation HTTP {status} (attempt {attempt}) {note!r}")
                     time.sleep(10)
                 except PWTimeout:
                     attempt += 1
@@ -794,54 +808,54 @@ def main():
                     attempt += 1
                     err(f"{type(e).__name__}: {e} (attempt {attempt})")
                     time.sleep(10)
+            made += 1
 
             if not data:
                 failed_n += 1
                 manifest.writerow([url, title, "", "failed", 0, 0, 0])
                 mf.flush()
-                continue
-
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / "conversation.md").write_text(
-                render_markdown(data, url, title), encoding="utf-8"
-            )
-
-            refs = collect_file_refs(data)
-            srefs = collect_sandbox_refs(data)
-            f_ok = f_fail = 0
-            if refs or srefs:
-                log(f"    {len(refs)} file(s) + {len(srefs)} generated file(s), downloading...")
-                f_ok, f_fail = download_files(
-                    page, context, refs, folder / "files", auth, err
+            else:
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "conversation.md").write_text(
+                    render_markdown(data, url, title), encoding="utf-8"
                 )
-                s_ok, s_fail = download_sandbox_files(
-                    page, context, cid, srefs, folder / "files", auth, err
+
+                refs = collect_file_refs(data)
+                srefs = collect_sandbox_refs(data)
+                f_ok = f_fail = 0
+                if refs or srefs:
+                    log(f"    {len(refs)} file(s) + {len(srefs)} generated file(s), downloading...")
+                    f_ok, f_fail = download_files(
+                        page, context, refs, folder / "files", auth, err
+                    )
+                    s_ok, s_fail = download_sandbox_files(
+                        page, context, cid, srefs, folder / "files", auth, err
+                    )
+                    f_ok += s_ok
+                    f_fail += s_fail
+
+                n_msgs = len(ordered_messages(data))
+                # written last: acts as the completion marker for resume
+                (folder / "conversation.json").write_text(
+                    json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
                 )
-                f_ok += s_ok
-                f_fail += s_fail
+                manifest.writerow(
+                    [url, title, folder.name, "ok", n_msgs, f_ok, f_fail]
+                )
+                mf.flush()
+                exported += 1
+                if rl_hits:
+                    extra_delay = min(extra_delay + EXTRA_DELAY_PER_429 * rl_hits, EXTRA_DELAY_CAP)
+                    log(f"    pace slowed: +{extra_delay:.0f}s per chat from now on")
+                if exported % LONG_BREAK_EVERY == 0:
+                    pause = random.uniform(*LONG_BREAK_S)
+                    log(f"    taking a {int(pause)}s breather after {exported} chats...")
+                    time.sleep(pause)
 
-            last_auth = auth
-            n_msgs = len(ordered_messages(data))
-            # written last: acts as the completion marker for resume
-            (folder / "conversation.json").write_text(
-                json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-            manifest.writerow(
-                [url, title, folder.name, "ok", n_msgs, f_ok, f_fail]
-            )
-            mf.flush()
-            exported += 1
-            if rl_hits:
-                extra_delay = min(extra_delay + EXTRA_DELAY_PER_429 * rl_hits, EXTRA_DELAY_CAP)
-                log(f"    pace slowed: +{extra_delay:.0f}s per chat from now on")
-            if exported % LONG_BREAK_EVERY == 0:
-                pause = random.uniform(*LONG_BREAK_S)
-                log(f"    taking a {int(pause)}s breather after {exported} chats...")
-                time.sleep(pause)
-            time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
+            ramp = min(RAMP_CAP, (made // RAMP_EVERY) * RAMP_STEP)
+            time.sleep(random.uniform(*DELAY_RANGE) + max(extra_delay, ramp))
 
-        library_sweep(page, context, args.out,
-                      last_auth or capture_auth(page), gerr)
+        library_sweep(page, context, args.out, auth, gerr)
         context.close()
 
     log("")
