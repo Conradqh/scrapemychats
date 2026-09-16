@@ -5,10 +5,11 @@ For ChatGPT accounts where the built-in "export data" button is unavailable
 Playwright using a persistent profile, so you log into ChatGPT once and every
 later run is automatic. Your data never leaves your machine.
 
-How it works: when the browser opens a chat, the ChatGPT page itself requests
-the full conversation JSON from its backend. This script captures that
-response (so it never needs to touch your credentials), renders it to
-Markdown, and downloads every referenced file/image using the same session.
+How it works: once you are logged in, the script copies the auth headers the
+ChatGPT frontend itself sends and uses them, from inside the page, to fetch
+each conversation's full JSON from ChatGPT's backend (so it never needs to
+touch your credentials). It renders that JSON to Markdown and downloads every
+referenced file/image using the same session.
 
 Usage:
     python export_chats.py                 # discover all chats, export them all
@@ -228,12 +229,11 @@ def discover_projects(page, headers):
     return chats
 
 
-def discover_chats(page, csv_path):
+def discover_chats(page, csv_path, headers):
     """Discover all conversations (main sidebar + every project) and merge
     them into csv_path, preserving existing rows and their order so that
     export folder numbering stays stable across runs."""
     log("Discovering conversations in this account...")
-    headers = capture_auth(page)
     found = discover_main(page, headers)
     log("Discovering project conversations...")
     found += discover_projects(page, headers)
@@ -665,18 +665,35 @@ def fix_files(page, context, out_dir, auth, ef):
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
-    with page.expect_response(
-        lambda r: f"/backend-api/conversation/{cid}" in r.url
-        and r.request.method == "GET",
-        timeout=NAV_TIMEOUT_MS,
-    ) as resp_info:
-        page.goto(url, wait_until="domcontentloaded")
-    resp = resp_info.value
-    if resp.status != 200:
-        return None, None, resp.status
-    return resp.json(), auth_headers_from(resp.request.headers), 200
+def fetch_conversation(page, cid, auth_headers):
+    """Fetch the complete conversation JSON straight from the backend.
+
+    Earlier versions navigated to the chat and captured the page's own
+    GET /backend-api/conversation/{id} response. The ChatGPT frontend no
+    longer makes that request: it now loads a paginated
+    /backend-api/conversations/{id}?num_turns=10 (plural, capped at 100
+    turns, different shape). The singular endpoint still returns the whole
+    conversation (mapping + current_node) when called directly with the
+    same session headers, so that's what we do — no page navigation needed.
+
+    Returns (data, 200) on success or (None, http_status) otherwise. Raises
+    if a 200 response isn't a conversation, so it gets logged instead of
+    being silently counted as a failed chat.
+    """
+    res = fetch_with_session(
+        page, f"{BASE_URL}/backend-api/conversation/{cid}", auth_headers
+    )
+    if res["status"] != 200:
+        return None, res["status"]
+    try:
+        data = json.loads(res["body"] or "")
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or "mapping" not in data:
+        raise RuntimeError(
+            f"unexpected conversation payload: {(res['body'] or '')[:200]!r}"
+        )
+    return data, 200
 
 
 def main():
@@ -746,13 +763,13 @@ def main():
             log("fix-files pass complete.")
             return
 
+        auth = capture_auth(page)
         if args.rediscover or not args.csv.exists():
-            discover_chats(page, args.csv)
+            discover_chats(page, args.csv, auth)
         chats = read_chat_list(args.csv)
         if args.limit:
             chats = chats[: args.limit]
         log(f"{len(chats)} chats to process")
-        last_auth = None
 
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
@@ -765,11 +782,11 @@ def main():
                 ef.flush()
 
             log(f"[{i}/{len(chats)}] {title}")
-            data = auth = None
+            data = None
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid)
+                    data, status = fetch_conversation(page, cid, auth)
                     if status == 200:
                         break
                     if status in (429, 403):
@@ -784,6 +801,12 @@ def main():
                         continue
                     attempt += 1
                     err(f"conversation HTTP {status} (attempt {attempt})")
+                    if status == 401:
+                        # session token expired during a long run: reload the
+                        # homepage so the frontend renews it, then copy it again
+                        log("    session token expired, refreshing...")
+                        auth = capture_auth(page)
+                        continue
                     time.sleep(10)
                 except PWTimeout:
                     attempt += 1
@@ -820,7 +843,6 @@ def main():
                 f_ok += s_ok
                 f_fail += s_fail
 
-            last_auth = auth
             n_msgs = len(ordered_messages(data))
             # written last: acts as the completion marker for resume
             (folder / "conversation.json").write_text(
@@ -840,8 +862,7 @@ def main():
                 time.sleep(pause)
             time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
 
-        library_sweep(page, context, args.out,
-                      last_auth or capture_auth(page), gerr)
+        library_sweep(page, context, args.out, auth, gerr)
         context.close()
 
     log("")

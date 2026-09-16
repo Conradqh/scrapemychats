@@ -212,12 +212,12 @@ re-run; regeneration takes seconds.
 ## How it works
 
 Rather than scraping the page or asking for your credentials, the script
-waits for ChatGPT's own frontend to request each conversation's JSON from
-its backend and captures that response. Attachments come through the files
-API, generated files through the interpreter-download API, and stale
-uploads through the account Library — all using the same session headers
-the page itself uses. This makes the export complete and robust to UI
-redesigns.
+copies the session headers ChatGPT's own frontend sends and uses them, from
+inside the logged-in page, to fetch each conversation's complete JSON from
+the backend. Attachments come through the files API, generated files
+through the interpreter-download API, and stale uploads through the account
+Library — all with those same headers. This makes the export complete and
+robust to UI redesigns.
 
 ## Disclaimer
 
