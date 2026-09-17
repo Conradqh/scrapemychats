@@ -57,6 +57,10 @@ python export_chats.py
 
 # 3. Build the viewer, then open export/viewer.html in your browser
 python build_viewer.py
+
+# Later: pick up new chats and re-export ones that changed on ChatGPT
+#    since the last run (then rebuild the viewer as in step 3)
+python export_chats.py --update
 ```
 
 The chat list is discovered automatically (including chats inside
@@ -197,6 +201,11 @@ re-run; regeneration takes seconds.
   time it happens. A 600-chat archive takes a few hours. Let it run.
 - **It's resumable.** Interrupt any time; re-running skips everything
   already exported and retries failures.
+- **It's repeatable.** A plain re-run only works through the saved chat
+  list. To keep an archive current, run `python export_chats.py --update`:
+  it re-lists the account, exports chats that are new, and re-exports any
+  chat that changed on ChatGPT since it was exported (compared by
+  last-updated time). Nothing is ever removed from the archive.
 - **Some old files are gone forever.** OpenAI deletes uploaded file content
   server-side after a retention period. Those downloads fail with "file not
   found" — logged in `errors.log` — but the conversation text referencing
@@ -212,12 +221,12 @@ re-run; regeneration takes seconds.
 ## How it works
 
 Rather than scraping the page or asking for your credentials, the script
-waits for ChatGPT's own frontend to request each conversation's JSON from
-its backend and captures that response. Attachments come through the files
-API, generated files through the interpreter-download API, and stale
-uploads through the account Library — all using the same session headers
-the page itself uses. This makes the export complete and robust to UI
-redesigns.
+copies the session headers ChatGPT's own frontend sends and uses them, from
+inside the logged-in page, to fetch each conversation's complete JSON from
+the backend. Attachments come through the files API, generated files
+through the interpreter-download API, and stale uploads through the account
+Library — all with those same headers. This makes the export complete and
+robust to UI redesigns.
 
 ## Disclaimer
 
