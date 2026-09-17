@@ -34,6 +34,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -665,18 +666,65 @@ def fix_files(page, context, out_dir, auth, ef):
 # --------------------------------------------------------------- main loop
 
 
+def valid_conversation(data):
+    """Reject status responses and incomplete conversation payloads."""
+    return (isinstance(data, dict)
+            and isinstance(data.get("mapping"), dict)
+            and bool(data["mapping"]))
+
+
+def already_exported(path):
+    """Only skip files containing a real conversation, not status JSON."""
+    try:
+        return valid_conversation(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+
+
 def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
-    with page.expect_response(
-        lambda r: f"/backend-api/conversation/{cid}" in r.url
-        and r.request.method == "GET",
-        timeout=NAV_TIMEOUT_MS,
-    ) as resp_info:
+    """Accept conversation payloads across endpoint variants, never status JSON."""
+    captured = []
+    observed = []
+
+    def receive(response):
+        path = urlsplit(response.url).path
+        if "/backend-api/" not in path or f"/conversation/{cid}" not in path:
+            return
+        observed.append(f"{response.request.method} {path}: HTTP {response.status}")
+        if response.status != 200:
+            return
+        try:
+            data = response.json()
+        except Exception:
+            return
+        if valid_conversation(data):
+            captured.append((data, auth_headers_from(response.request.headers), 200))
+
+    page.on("response", receive)
+    try:
         page.goto(url, wait_until="domcontentloaded")
-    resp = resp_info.value
-    if resp.status != 200:
-        return None, None, resp.status
-    return resp.json(), auth_headers_from(resp.request.headers), 200
+        deadline = time.monotonic() + NAV_TIMEOUT_MS / 1000
+        while not captured and time.monotonic() < deadline:
+            page.wait_for_timeout(250)
+        if captured:
+            return captured[0]
+    finally:
+        page.remove_listener("response", receive)
+
+    # The frontend may load chats differently; try the authenticated JSON API.
+    log("    No conversation payload captured; trying authenticated API...")
+    headers = capture_auth(page)
+    result = fetch_with_session(page, f"{BASE_URL}/backend-api/conversation/{cid}", headers)
+    if result["status"] != 200:
+        return None, None, result["status"]
+    try:
+        data = json.loads(result["body"])
+    except (ValueError, TypeError):
+        data = None
+    if valid_conversation(data):
+        return data, headers, 200
+    details = "; ".join(observed[-8:]) or "no matching responses"
+    raise ValueError(f"No conversation mapping received. Observed: {details}")
 
 
 def main():
@@ -756,7 +804,7 @@ def main():
 
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
-            if (folder / "conversation.json").exists():
+            if already_exported(folder / "conversation.json"):
                 skipped += 1
                 continue
 
