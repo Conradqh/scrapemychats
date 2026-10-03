@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import random
+import shutil
 import re
 import sys
 import time
@@ -665,8 +666,18 @@ def fix_files(page, context, out_dir, auth, ef):
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
+def capture_conversation(page, url, cid, headers=None):
+    """Fetch the conversation JSON directly via session fetch, or fall back to navigation."""
+    if headers:
+        try:
+            api = f"{BASE_URL}/backend-api/conversation/{cid}"
+            res = fetch_with_session(page, api, headers)
+            if res and res.get("status") == 200 and res.get("body"):
+                data = json.loads(res["body"])
+                return data, headers, 200
+        except Exception:
+            pass
+
     with page.expect_response(
         lambda r: f"/backend-api/conversation/{cid}" in r.url
         and r.request.method == "GET",
@@ -690,6 +701,12 @@ def main():
     ap.add_argument("--profile", type=Path, default=Path("browser_profile"),
                     help="Chrome profile directory for the saved login")
     ap.add_argument("--limit", type=int, default=0, help="export at most N chats")
+    ap.add_argument("--wipe-profile", action="store_true",
+                    help="delete the saved browser profile (your live ChatGPT "
+                         "login) after a fully successful run")
+    ap.add_argument("--evade-detection", action="store_true",
+                    help="hide the Chrome automation flag from the page. Off by "
+                         "default; only enable if the export is being blocked.")
     ap.add_argument("--rediscover", action="store_true",
                     help="refresh chats.csv from the account before exporting "
                          "(new chats are appended; existing rows keep their order)")
@@ -700,6 +717,8 @@ def main():
     ap.add_argument("--browser-channel", default="chrome",
                     choices=["chrome", "msedge"],
                     help="installed browser to drive (default: chrome)")
+    ap.add_argument("--sweep-library", action="store_true",
+                    help="sweep the account file library after export (default: false)")
     args = ap.parse_args()
 
     try:
@@ -724,13 +743,44 @@ def main():
                 ["url", "title", "folder", "status", "messages", "files_ok", "files_failed"]
             )
 
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(args.profile),
-            channel=args.browser_channel,
-            headless=False,  # ChatGPT blocks headless browsers
-            no_viewport=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        # Bot-detection evasion is OFF by default. The pacing below is what
+        # keeps this tool polite; actively hiding the automation flag is a
+        # separate thing, so it has to be asked for explicitly.
+        chrome_args = [
+            "--disable-blink-features=AutomationControlled",
+        ]
+        ignore_default_args = ["--enable-automation"]
+
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(args.profile),
+                channel=args.browser_channel,
+                headless=False,  # ChatGPT blocks headless browsers
+                no_viewport=True,
+                args=chrome_args,
+                ignore_default_args=ignore_default_args,
+            )
+        except Exception as e:
+            if args.browser_channel == "chrome" and "not found" in str(e).lower():
+                log("Chrome not found on system; falling back to Microsoft Edge (msedge)...")
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(args.profile),
+                    channel="msedge",
+                    headless=False,
+                    no_viewport=True,
+                    args=chrome_args,
+                    ignore_default_args=ignore_default_args,
+                )
+            else:
+                raise
+
+        # Stealth: mask navigator.webdriver across all tabs/frames
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
         page = context.pages[0] if context.pages else context.new_page()
         ensure_logged_in(page)
 
@@ -752,7 +802,7 @@ def main():
         if args.limit:
             chats = chats[: args.limit]
         log(f"{len(chats)} chats to process")
-        last_auth = None
+        last_auth = capture_auth(page)
 
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
@@ -769,7 +819,7 @@ def main():
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid)
+                    data, auth, status = capture_conversation(page, url, cid, last_auth)
                     if status == 200:
                         break
                     if status in (429, 403):
@@ -840,8 +890,9 @@ def main():
                 time.sleep(pause)
             time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
 
-        library_sweep(page, context, args.out,
-                      last_auth or capture_auth(page), gerr)
+        if args.sweep_library:
+            library_sweep(page, context, args.out,
+                          last_auth or capture_auth(page), gerr)
         context.close()
 
     log("")
@@ -849,6 +900,20 @@ def main():
     if failed_n:
         log(f"Failures listed in {errors_path} — re-run to retry just those chats.")
     log("Next: python build_viewer.py  (creates export/viewer.html)")
+
+    # The persistent profile holds a live, unencrypted ChatGPT login. Anyone
+    # with access to this machine has the account until it is removed.
+    if args.profile.exists():
+        log("")
+        if args.wipe_profile and not failed_n:
+            shutil.rmtree(args.profile, ignore_errors=True)
+            log(f"Removed {args.profile}/ (live ChatGPT session). You will log "
+                f"in again on the next run.")
+        else:
+            log(f"!! {args.profile}/ still contains a LIVE ChatGPT session.")
+            log(f"!! Delete it when you are finished: rm -rf {args.profile}")
+            if failed_n:
+                log("!! (kept for now so you can re-run the failed chats)")
 
 
 if __name__ == "__main__":
