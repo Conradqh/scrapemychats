@@ -665,18 +665,25 @@ def fix_files(page, context, out_dir, auth, ef):
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
-    with page.expect_response(
-        lambda r: f"/backend-api/conversation/{cid}" in r.url
-        and r.request.method == "GET",
-        timeout=NAV_TIMEOUT_MS,
-    ) as resp_info:
-        page.goto(url, wait_until="domcontentloaded")
-    resp = resp_info.value
-    if resp.status != 200:
-        return None, None, resp.status
-    return resp.json(), auth_headers_from(resp.request.headers), 200
+def fetch_conversation(page, cid, auth_headers):
+    """Fetch one conversation through the already-authenticated page session.
+
+    Relying on a navigation to trigger ChatGPT's frontend request is brittle:
+    the client may serve a cached route or change its loading behavior without
+    requesting the conversation endpoint. The same session API is used for
+    discovery and preserves the browser's cookies and fingerprint.
+    """
+    res = fetch_with_session(
+        page, f"{BASE_URL}/backend-api/conversation/{cid}", auth_headers
+    )
+    if res["status"] != 200:
+        return None, auth_headers, res["status"]
+    try:
+        return json.loads(res["body"]), auth_headers, 200
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"conversation response was not JSON: {res['body'][:200]!r}"
+        ) from e
 
 
 def main():
@@ -752,7 +759,9 @@ def main():
         if args.limit:
             chats = chats[: args.limit]
         log(f"{len(chats)} chats to process")
-        last_auth = None
+        # The conversation and file endpoints require the workspace header
+        # emitted by ChatGPT's own requests.
+        last_auth = capture_auth(page)
 
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
@@ -769,7 +778,7 @@ def main():
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid)
+                    data, auth, status = fetch_conversation(page, cid, last_auth)
                     if status == 200:
                         break
                     if status in (429, 403):
@@ -787,8 +796,8 @@ def main():
                     time.sleep(10)
                 except PWTimeout:
                     attempt += 1
-                    err(f"timeout waiting for conversation JSON (attempt {attempt})")
-                    log("    timed out (Cloudflare check? solve it in the window if shown)")
+                    err(f"timeout fetching conversation JSON (attempt {attempt})")
+                    log("    request timed out (check the browser for an interstitial)")
                     time.sleep(15)
                 except Exception as e:
                     attempt += 1
