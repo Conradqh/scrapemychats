@@ -195,6 +195,14 @@ re-run; regeneration takes seconds.
   requests too quickly"). The script paces itself (~10–20 s per chat), backs
   off in escalating steps when throttled, and permanently slows down each
   time it happens. A 600-chat archive takes a few hours. Let it run.
+- **For large archives, add `--no-page-load`.** By default the script opens
+  each chat's page in Chrome before fetching it, which makes ChatGPT's own
+  page code send many extra requests that count toward the throttle. With
+  `--no-page-load` the Chrome window stays on one ChatGPT page (it will look
+  idle) and each chat is fetched directly. On a 3,000-chat account this ran
+  about 2½× faster once throttling set in (≈55 vs ≈22 chats/hour, with
+  7–19 chats between throttles instead of 2–4). If a Cloudflare check
+  appears, the script opens the chat page so you can solve it in the window.
 - **It's resumable.** Interrupt any time; re-running skips everything
   already exported and retries failures.
 - **Some old files are gone forever.** OpenAI deletes uploaded file content
@@ -228,7 +236,8 @@ re-run; regeneration takes seconds.
 Rather than scraping the page or asking for your credentials, the script
 opens each chat in the logged-in browser and requests the conversation's
 JSON from ChatGPT's backend from inside that page, using the auth headers
-ChatGPT's own frontend uses. Attachments come through the files
+ChatGPT's own frontend uses (with `--no-page-load`, it skips opening the
+chat and makes the same request from the ChatGPT page already open). Attachments come through the files
 API, generated files through the interpreter-download API, and stale
 uploads through the account Library — all using the same session headers
 the page itself uses. This makes the export complete and robust to UI

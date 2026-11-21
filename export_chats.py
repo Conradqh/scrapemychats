@@ -1046,7 +1046,7 @@ def rerender(out_dir, ef):
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid, auth):
+def capture_conversation(page, url, cid, auth, load_page=True):
     """Open the chat, then fetch its conversation JSON from inside the page.
 
     ChatGPT's frontend no longer reliably issues GET
@@ -1055,10 +1055,13 @@ def capture_conversation(page, url, cid, auth):
     request times out. We navigate (so the session looks normal) and then
     request the JSON ourselves with the frontend's auth headers.
     Returns (data, auth_headers, status); status is "challenge" when
-    Cloudflare is showing a check that the user must solve in the window."""
+    Cloudflare is showing a check that the user must solve in the window.
+    With load_page=False the chat page isn't opened: the JSON is fetched from
+    whatever chatgpt.com page is already open (fewer requests per chat)."""
     if not auth:
         auth = capture_auth(page)
-    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    if load_page or not page.url.startswith(BASE_URL):
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     api = f"{BASE_URL}/backend-api/conversation/{cid}"
     res = fetch_with_session(page, api, auth)
     if res["status"] == 401:
@@ -1097,6 +1100,10 @@ def main():
                     help="don't contact ChatGPT; rebuild conversation.md of every "
                          "already-exported chat from its conversation.json and "
                          "download images shown in rich answers")
+    ap.add_argument("--no-page-load", action="store_true",
+                    help="don't open each chat's page in the browser; fetch its "
+                         "JSON directly from the open ChatGPT tab (fewer requests "
+                         "per chat, may reduce throttling)")
     ap.add_argument("--limit-files", action="store_true",
                     help="in the Library sweep, download only files that came "
                          "from exported chats (default: the whole Library, "
@@ -1184,13 +1191,21 @@ def main():
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid, conv_auth)
+                    data, auth, status = capture_conversation(
+                        page, url, cid, conv_auth, load_page=not args.no_page_load)
                     conv_auth = auth
                     if status == 200:
                         break
                     if status == "challenge":
                         attempt += 1
                         err(f"Cloudflare check on chat page (attempt {attempt})")
+                        if args.no_page_load:
+                            # show the check in the window so it can be solved
+                            try:
+                                page.goto(url, wait_until="domcontentloaded",
+                                          timeout=NAV_TIMEOUT_MS)
+                            except PWTimeout:
+                                pass
                         log("    Cloudflare check: solve it in the Chrome window; retrying in 30s")
                         time.sleep(30)
                         continue
