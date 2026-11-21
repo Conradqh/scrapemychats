@@ -90,8 +90,23 @@ def parse_chat(folder, keywords):
         files = [f"{folder.name}/files/{p.name}" for p in sorted(fdir.iterdir())
                  if not re.fullmatch(r"genui_[0-9a-f]+\.\w+", p.name)]
 
+    # Project / custom GPT this chat belongs to (recorded by ChatGPT in the JSON)
+    proj, kind = "", ""
+    try:
+        d = json.loads((folder / "conversation.json").read_text(encoding="utf-8"))
+        gid, gtype = d.get("gizmo_id") or "", d.get("gizmo_type") or ""
+        if isinstance(gid, str) and gid:
+            if gtype == "snorlax" or gid.startswith("g-p-"):
+                proj, kind = gid, "project"
+            elif gtype == "gpt":
+                proj, kind = gid, "gpt"
+    except (OSError, ValueError, AttributeError):
+        pass
+
     group, sub = classify(title, body, keywords)
     return {
+        "p": proj,
+        "pk": kind,
         "id": folder.name,
         "t": title,
         "d": date,
@@ -139,8 +154,32 @@ def main():
         group_order.append("Unsorted")
         sub_order["Unsorted"] = ["Unsorted"]
 
+    # names for Projects / custom GPTs, saved by export_chats.py (discovery or
+    # --list-projects); unnamed ones fall back to a shortened id
+    try:
+        names = json.loads((args.export / "projects.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        names = {}
+    pcount = {}
+    for c in chats:
+        if c["p"]:
+            pcount[(c["p"], c["pk"])] = pcount.get((c["p"], c["pk"]), 0) + 1
+    projects = []
+    for (pid, kind), n in pcount.items():
+        table = (names.get("projects") if kind == "project" else names.get("gpts")) or {}
+        label = table.get(pid) or f"{'Project' if kind == 'project' else 'GPT'} {pid[-8:]}"
+        projects.append({"id": pid, "kind": kind, "name": label.strip(), "n": n})
+    projects.sort(key=lambda p: (p["kind"] != "project", p["name"].lower()))
+    unnamed = sum(1 for p in projects if p["id"] not in
+                  ((names.get("projects") or {}) | (names.get("gpts") or {})))
+    if projects:
+        print(f"{len(projects)} projects/custom GPTs"
+              + (f" ({unnamed} without a name — run export_chats.py --list-projects)"
+                 if unnamed else ""))
+
     dates = [c["d"][:10] for c in chats if c["d"]]
     meta = {
+        "projects": projects,
         "count": len(chats),
         "from": min(dates) if dates else "",
         "to": max(dates) if dates else "",
@@ -257,6 +296,7 @@ body{
 }
 .stamp[data-gi="0"]{color:#3f5e46;border-color:#3f5e46}
 .stamp[data-gi="2"]{color:#3a5570;border-color:#3a5570}
+.stamp.pj{color:#6b4f2a;border-color:#6b4f2a;margin-left:6px}
 .empty{padding:60px 30px;text-align:center;color:var(--ink3);font-style:italic}
 .reader{overflow-y:auto;min-width:0}
 .placeholder{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--ink3)}
@@ -354,7 +394,9 @@ const DATA = JSON.parse(document.getElementById('data').textContent);
 DATA.forEach((c,i)=>{c.i=i; c.lt=c.t.toLowerCase(); c.lb=c.b.toLowerCase();});
 const GI={}; META.groups.forEach((g,i)=>GI[g]=(i+1)%3);
 
-let state = {q:'', group:null, sub:null, sort:'new', sel:-1, shown:[]};
+const PN={}; (META.projects||[]).forEach(p=>PN[p.id]=p.name);
+
+let state = {q:'', group:null, sub:null, proj:null, sort:'new', sel:-1, shown:[]};
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function stamp(c,label){
@@ -373,7 +415,7 @@ function counts(){
 }
 function buildRail(){
   const {g,s}=counts();
-  let h=`<button class="cat allbtn ${!state.group?'on':''}" data-g="" data-s="">All conversations <span class="n">${DATA.length}</span></button>`;
+  let h=`<button class="cat allbtn ${!state.group&&!state.proj?'on':''}" data-g="" data-s="">All conversations <span class="n">${DATA.length}</span></button>`;
   for(const grp of META.groups){
     if(!g[grp]) continue;
     h+=`<div class="grp"><span>${esc(grp)}</span><span class="gc">${g[grp]}</span></div>`;
@@ -385,11 +427,23 @@ function buildRail(){
       h+=`<button class="cat ${state.group===grp&&state.sub===sub?'on':''}" data-g="${esc(grp)}" data-s="${esc(sub)}">${esc(sub)} <span class="n">${s[grp+'|'+sub]}</span></button>`;
     }
   }
+  // ChatGPT Projects and custom GPTs, from each chat's recorded gizmo id
+  for(const [kind,heading] of [['project','Projects'],['gpt','Custom GPTs']]){
+    const ps=(META.projects||[]).filter(p=>p.kind===kind);
+    if(!ps.length) continue;
+    const tot=ps.reduce((a,p)=>a+p.n,0);
+    h+=`<div class="grp"><span>${heading}</span><span class="gc">${tot}</span></div>`;
+    for(const p of ps){
+      h+=`<button class="cat ${state.proj===p.id?'on':''}" data-p="${esc(p.id)}">${esc(p.name)} <span class="n">${p.n}</span></button>`;
+    }
+  }
   document.getElementById('rail').innerHTML=h;
 }
 document.getElementById('rail').addEventListener('click',e=>{
   const b=e.target.closest('.cat'); if(!b) return;
-  state.group=b.dataset.g||null; state.sub=b.dataset.s||null; state.sel=-1;
+  if(b.dataset.p){state.proj=b.dataset.p; state.group=null; state.sub=null;}
+  else{state.proj=null; state.group=b.dataset.g||null; state.sub=b.dataset.s||null;}
+  state.sel=-1;
   buildRail(); render();
 });
 
@@ -398,6 +452,7 @@ function filter(){
   const q=state.q.trim().toLowerCase();
   let out=DATA.filter(c=>
     (!state.group||c.g===state.group)&&(!state.sub||c.s===state.sub)&&
+    (!state.proj||c.p===state.proj)&&
     (!q||c.lt.includes(q)||c.lb.includes(q)));
   if(state.sort==='new') out.sort((a,b)=>(b.d||'').localeCompare(a.d||''));
   else if(state.sort==='old') out.sort((a,b)=>(a.d||'').localeCompare(b.d||''));
@@ -421,13 +476,13 @@ function render(){
     const d=c.d?c.d.slice(0,10):'——';
     const extras=[c.n+' msgs', c.f.length?c.f.length+' files':''].filter(Boolean).join(' · ');
     return `<div class="row ${idx===state.sel?'sel':''}" data-i="${c.i}" data-idx="${idx}">
-      <div class="top"><span class="date">${d}</span>${stamp(c,c.s)}</div>
+      <div class="top"><span class="date">${d}</span>${stamp(c,c.s)}${c.p&&!state.proj?`<span class="stamp pj">${esc(PN[c.p]||'project')}</span>`:''}</div>
       <h3>${esc(c.t)}</h3>
       ${q?`<div class="snip">${snippet(c,q)}</div>`:''}
       <div class="extras">${extras}</div>
     </div>`;}).join('');
   document.getElementById('rows').innerHTML=rows||'<div class="empty">Nothing in the archive matches.</div>';
-  const lab = state.sub||state.group||'all';
+  const lab = (state.proj&&PN[state.proj])||state.sub||state.group||'all';
   document.getElementById('shown').textContent=`${state.shown.length} filed under ${lab.toLowerCase()}`;
 }
 document.getElementById('rows').addEventListener('click',e=>{

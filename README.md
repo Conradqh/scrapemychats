@@ -225,6 +225,14 @@ re-run; regeneration takes seconds.
   `python export_chats.py --rerender` (no browser needed; it rebuilds
   `conversation.md` from the saved `conversation.json`), then rebuild the
   viewer.
+- **Projects and custom GPTs appear in the viewer's sidebar.** Each chat
+  records which ChatGPT Project (or custom GPT) it belongs to; the viewer
+  lists them under "Projects" and "Custom GPTs" with chat counts. Names come
+  from `export/projects.json`, which discovery writes. If the sidebar shows
+  IDs instead of names (e.g. an export made with an older version), run
+  `python export_chats.py --list-projects` (about a minute; no chats are
+  downloaded — not while another export is running, since both use the
+  same browser profile), then rebuild the viewer.
 - **Headless doesn't work.** ChatGPT's bot protection blocks invisible
   browsers; the visible Chrome window is required.
 - **Privacy.** `export/`, `chats.csv`, and `browser_profile/` are

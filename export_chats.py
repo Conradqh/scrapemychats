@@ -189,8 +189,9 @@ def discover_main(page, headers):
     ]
 
 
-def discover_projects(page, headers):
-    """Enumerate Projects and every conversation inside each of them."""
+def list_projects(page, headers):
+    """[(project id, name)] for every Project in the account, or None if the
+    listing failed."""
     projects, cursor = [], None
     while True:
         api = f"{BASE_URL}/backend-api/gizmos/snorlax/sidebar"
@@ -199,7 +200,7 @@ def discover_projects(page, headers):
         res = api_get(page, api, headers)
         if res["status"] != 200:
             log(f"  ! project listing failed (HTTP {res['status']}), skipping projects")
-            return []
+            return None
         data = json.loads(res["body"])
         for it in data.get("items") or []:
             g = it.get("gizmo") or {}
@@ -213,7 +214,15 @@ def discover_projects(page, headers):
         if not cursor or not data.get("items"):
             break
         time.sleep(random.uniform(1, 2))
+    return projects
 
+
+def discover_projects(page, headers):
+    """Enumerate Projects and every conversation inside each of them.
+    Returns (chats, projects)."""
+    projects = list_projects(page, headers)
+    if projects is None:
+        return [], None
     chats = []
     for gid, name in projects:
         got, page_cursor = 0, 0
@@ -240,10 +249,57 @@ def discover_projects(page, headers):
             page_cursor = nxt
             time.sleep(random.uniform(1, 2))
         log(f"  project {name!r}: {got} conversations")
-    return chats
+    return chats, projects
 
 
-def discover_chats(page, csv_path):
+def save_names(out_dir, projects=None, gpts=None):
+    """Merge {id: name} maps into out_dir/projects.json, which the viewer
+    uses to group chats by Project / custom GPT."""
+    path = out_dir / "projects.json"
+    try:
+        cur = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cur = {}
+    for key, new in (("projects", projects), ("gpts", gpts)):
+        if new:
+            cur.setdefault(key, {}).update(new)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cur, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path
+
+
+def exported_gpt_ids(out_dir):
+    """Custom-GPT ids referenced by already-exported chats."""
+    ids = set()
+    for p in out_dir.glob("*/conversation.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if d.get("gizmo_type") == "gpt" and d.get("gizmo_id"):
+            ids.add(d["gizmo_id"])
+    return ids
+
+
+def list_gpt_names(page, headers, gids):
+    """{gpt id: name}, best effort (unknown or deleted GPTs are skipped)."""
+    names = {}
+    for gid in sorted(gids):
+        try:
+            res = api_get(page, f"{BASE_URL}/backend-api/gizmos/{gid}", headers)
+            if res["status"] == 200:
+                d = json.loads(res["body"])
+                g = d.get("gizmo") or d
+                name = (g.get("display") or {}).get("name")
+                if name:
+                    names[gid] = name
+        except Exception:
+            pass
+        time.sleep(random.uniform(1, 2))
+    return names
+
+
+def discover_chats(page, csv_path, out_dir=None):
     """Discover all conversations (main sidebar + every project) and merge
     them into csv_path, preserving existing rows and their order so that
     export folder numbering stays stable across runs."""
@@ -251,7 +307,10 @@ def discover_chats(page, csv_path):
     headers = capture_auth(page)
     found = discover_main(page, headers)
     log("Discovering project conversations...")
-    found += discover_projects(page, headers)
+    pchats, projects = discover_projects(page, headers)
+    found += pchats
+    if projects and out_dir:
+        save_names(out_dir, projects=dict(projects))
 
     existing_rows, existing_ids = [], set()
     if csv_path.exists():
@@ -1100,6 +1159,10 @@ def main():
                     help="don't contact ChatGPT; rebuild conversation.md of every "
                          "already-exported chat from its conversation.json and "
                          "download images shown in rich answers")
+    ap.add_argument("--list-projects", action="store_true",
+                    help="only fetch the names of your Projects and of custom "
+                         "GPTs used in exported chats (saved to "
+                         "export/projects.json for the viewer), then exit")
     ap.add_argument("--no-page-load", action="store_true",
                     help="don't open each chat's page in the browser; fetch its "
                          "JSON directly from the open ChatGPT tab (fewer requests "
@@ -1155,6 +1218,17 @@ def main():
             ef.write(f"{msg}\n")
             ef.flush()
 
+        if args.list_projects:
+            auth = capture_auth(page)
+            projects = list_projects(page, auth) or []
+            gpts = list_gpt_names(page, auth, exported_gpt_ids(args.out))
+            path = save_names(args.out, projects=dict(projects), gpts=gpts)
+            context.close()
+            log(f"{len(projects)} project name(s), {len(gpts)} custom GPT name(s) "
+                f"saved to {path}")
+            log("Next: python build_viewer.py")
+            return
+
         if args.fix_files:
             auth = capture_auth(page)
             fix_files(page, context, args.out, auth, ef)
@@ -1169,7 +1243,7 @@ def main():
         # homepage then retries instead of aborting the run)
         conv_auth = None
         if args.rediscover or not args.csv.exists():
-            conv_auth = discover_chats(page, args.csv)
+            conv_auth = discover_chats(page, args.csv, args.out)
         chats = read_chat_list(args.csv)
         if args.limit:
             chats = chats[: args.limit]
