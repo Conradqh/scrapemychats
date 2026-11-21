@@ -203,6 +203,20 @@ re-run; regeneration takes seconds.
   them is still captured. No export method can recover them. The tool also
   recovers what it can from your account's file Library and from
   code-generated (sandbox) files.
+- **The Library sweep downloads your whole Library by default.** After the
+  chats, every file in the account Library is saved into the folder of the
+  chat it came from, or into `export/_library/` if that chat isn't exported
+  — even on a `--limit 3` test run. Add `--limit-files` to download only
+  files belonging to chats you've exported.
+- **Rich answers (photo cards, places, maps) are converted to plain
+  Markdown.** ChatGPT stores these as layout code; the exporter uses
+  ChatGPT's own Markdown version instead, saves the photos into the chat's
+  `files/` folder (shown inline in the viewer), and turns maps into a list
+  of places with OpenStreetMap links. If you exported chats with an older
+  version and see tags like `<AsyncImage …>`, run
+  `python export_chats.py --rerender` (no browser needed; it rebuilds
+  `conversation.md` from the saved `conversation.json`), then rebuild the
+  viewer.
 - **Headless doesn't work.** ChatGPT's bot protection blocks invisible
   browsers; the visible Chrome window is required.
 - **Privacy.** `export/`, `chats.csv`, and `browser_profile/` are
@@ -212,8 +226,9 @@ re-run; regeneration takes seconds.
 ## How it works
 
 Rather than scraping the page or asking for your credentials, the script
-waits for ChatGPT's own frontend to request each conversation's JSON from
-its backend and captures that response. Attachments come through the files
+opens each chat in the logged-in browser and requests the conversation's
+JSON from ChatGPT's backend from inside that page, using the auth headers
+ChatGPT's own frontend uses. Attachments come through the files
 API, generated files through the interpreter-download API, and stale
 uploads through the account Library — all using the same session headers
 the page itself uses. This makes the export complete and robust to UI

@@ -86,7 +86,9 @@ def parse_chat(folder, keywords):
     files = []
     fdir = folder / "files"
     if fdir.is_dir():
-        files = [f"{folder.name}/files/{p.name}" for p in sorted(fdir.iterdir())]
+        # rich-answer images (genui_*) are shown inline in the text instead
+        files = [f"{folder.name}/files/{p.name}" for p in sorted(fdir.iterdir())
+                 if not re.fullmatch(r"genui_[0-9a-f]+\.\w+", p.name)]
 
     group, sub = classify(title, body, keywords)
     return {
@@ -299,6 +301,7 @@ body{
 .body mark{background:#f3d370;padding:0 1px}
 .lb{position:fixed;inset:0;background:rgba(20,16,10,.88);display:none;align-items:center;justify-content:center;z-index:50;cursor:zoom-out}
 .lb.on{display:flex}
+.body img.inl{max-width:220px;max-height:280px;object-fit:cover;border:1px solid var(--rule);background:#fff;padding:2px;margin:4px 6px 4px 0;vertical-align:top;cursor:zoom-in}
 .lb img{max-width:92vw;max-height:92vh;background:#fff;padding:4px}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--paper3);border:2px solid var(--paper)}
@@ -435,7 +438,14 @@ document.getElementById('rows').addEventListener('click',e=>{
 document.getElementById('sort').addEventListener('change',e=>{state.sort=e.target.value;state.sel=-1;render()});
 
 /* ---------------- markdown ---------------- */
+// encode each path segment ('#', '?', '%' in folder names must not become URL syntax)
+function encPath(p){return p.split('/').map(encodeURIComponent).join('/')}
+let CUR_ID='';  // folder of the chat being rendered; inline images resolve against it
 function inline(s){
+  // only images saved locally by the exporter (files/genui_<hash>.<ext>); remote stays blocked
+  s=s.replace(/!\[([^\]]*)\]\((files\/genui_[0-9a-f]+\.(?:jpg|png|webp|gif))\)/g,(m,a,u)=>{
+    const src=esc(encPath(CUR_ID+'/'+u));
+    return `<img class="inl" loading="lazy" src="${src}" alt="${a}" title="${a}" onclick="lightbox(this.src)">`;});
   s=s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,(m,a,u)=>`<span class="asset">🖼 ${esc(a||'image')}</span>`);
   s=s.replace(/\[image: [^\]]+\]/g,'<span class="asset">🖼 image</span>');
   s=s.replace(/\[([^\]]+)\]\((https?:[^)\s"'<>`]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -464,9 +474,10 @@ function mdToHtml(md){
     if(h){endP();const lv=Math.min(h[1].length+1,4);html+=`<h${lv}>${inline(esc(h[2]))}</h${lv}>`;i++;continue;}
     if(/^\s*([-*]|\d+\.)\s+/.test(ln)){endP();
       const ord=/^\s*\d+\./.test(ln);const tag=ord?'ol':'ul';let items=[];
+      const st=ord?parseInt(ln,10):1;
       while(i<lines.length&&/^\s*([-*]|\d+\.)\s+/.test(lines[i])){
         items.push(lines[i].replace(/^\s*([-*]|\d+\.)\s+/,''));i++;}
-      html+=`<${tag}>`+items.map(x=>'<li>'+inline(esc(x))+'</li>').join('')+`</${tag}>`;continue;}
+      html+=(ord&&st>1?`<ol start="${st}">`:`<${tag}>`)+items.map(x=>'<li>'+inline(esc(x))+'</li>').join('')+`</${tag}>`;continue;}
     if(/^>/.test(ln)){endP();let qs=[];
       while(i<lines.length&&/^>/.test(lines[i])){qs.push(lines[i].replace(/^>\s?/,''));i++;}
       html+='<blockquote>'+inline(esc(qs.join('<br>')))+'</blockquote>';continue;}
@@ -481,6 +492,7 @@ function mdToHtml(md){
 const IMG_RE=/\.(png|jpe?g|webp|gif)$/i;
 function open(c){
   const reader=document.getElementById('reader');
+  CUR_ID=c.id;
   const parts=c.b.split(/^## /m).filter(x=>x.trim());
   const msgs=parts.map(p=>{
     const nl=p.indexOf('\n');
@@ -495,8 +507,8 @@ function open(c){
   const imgs=c.f.filter(f=>IMG_RE.test(f));
   const other=c.f.filter(f=>!IMG_RE.test(f));
   const strip = c.f.length?`<div class="filestrip">`+
-      imgs.map(f=>`<img loading="lazy" src="${encodeURI(f)}" onclick="lightbox(this.src)" title="${esc(f.split('/').pop())}">`).join('')+
-      other.map(f=>`<a class="fchip" href="${encodeURI(f)}" target="_blank">📎 ${esc(f.split('/').pop())}</a>`).join('')+
+      imgs.map(f=>`<img loading="lazy" src="${esc(encPath(f))}" onclick="lightbox(this.src)" title="${esc(f.split('/').pop())}">`).join('')+
+      other.map(f=>`<a class="fchip" href="${esc(encPath(f))}" target="_blank">📎 ${esc(f.split('/').pop())}</a>`).join('')+
     `</div>`:'';
   reader.innerHTML=`<div class="doc">
     <button class="back" onclick="closeReader()">&larr; back to list</button>
@@ -506,7 +518,7 @@ function open(c){
       <div class="meta">
         <span>${c.d||'undated'}</span><span>${c.n} messages</span>
         ${/^https?:\/\/[^"'<>\s]+$/.test(c.u)?`<a href="${esc(c.u)}" target="_blank" rel="noopener">original ↗</a>`:''}
-        <a href="${encodeURI(c.id)}/" target="_blank">folder ↗</a>
+        <a href="${esc(encPath(c.id))}/" target="_blank">folder ↗</a>
       </div>
     </div>
     ${strip}
