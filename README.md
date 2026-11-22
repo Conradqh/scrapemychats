@@ -177,6 +177,33 @@ assistant drive:
 
 ---
 
+## All options
+
+`python export_chats.py [options]`
+
+| Option | What it does |
+|---|---|
+| *(none)* | Discover every chat (first run), export all not yet exported, then sweep the file Library |
+| `--limit N` | Export at most N chats. Good for a first test run (`--limit 3`) |
+| `--no-page-load` | Fetch each chat directly instead of opening its page first. Fewer requests; about 2½× faster once ChatGPT starts throttling. The Chrome window looks idle |
+| `--rediscover` | Refresh `chats.csv` from the account first (new chats are added; existing numbering is kept) |
+| `--csv FILE` | Use this chat list instead of `chats.csv` |
+| `--out DIR` | Output folder (default `export`) |
+| `--profile DIR` | Chrome profile folder holding the saved login (default `browser_profile`) |
+| `--browser-channel chrome\|msedge` | Which installed browser to drive (default `chrome`) |
+| `--limit-files` | In the Library sweep, download only files from exported chats (default: whole Library; unmatched files go to `export/_library/`) |
+| `--fix-files` | Don't export chats. Revisit exported ones and fetch missing attachments, generated files and Library files |
+| `--rerender` | Don't contact ChatGPT. Rebuild every `conversation.md` from its saved `conversation.json` and download rich-answer images; no browser needed |
+| `--list-projects` | Only fetch Project and custom-GPT names into `export/projects.json` for the viewer, then exit |
+
+`python build_viewer.py [options]`
+
+| Option | What it does |
+|---|---|
+| `--export DIR` | Export folder to read (default `export`) |
+| `--categories FILE` | Category keyword file (default `categories.json`; optional) |
+| `--title TEXT` | Title shown at the top of the viewer |
+
 ## Categories (optional)
 
 ```bash

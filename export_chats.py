@@ -5,16 +5,20 @@ For ChatGPT accounts where the built-in "export data" button is unavailable
 Playwright using a persistent profile, so you log into ChatGPT once and every
 later run is automatic. Your data never leaves your machine.
 
-How it works: when the browser opens a chat, the ChatGPT page itself requests
-the full conversation JSON from its backend. This script captures that
-response (so it never needs to touch your credentials), renders it to
-Markdown, and downloads every referenced file/image using the same session.
+How it works: from inside the logged-in ChatGPT page, the script requests
+each conversation's JSON from ChatGPT's backend with the same auth headers
+the page itself uses (so it never needs your credentials). By default it
+opens each chat's page first; with --no-page-load it fetches directly from
+the page already open. It renders each chat to Markdown and downloads every
+referenced file/image using the same session.
 
 Usage:
     python export_chats.py                 # discover all chats, export them all
     python export_chats.py --limit 3      # small test run first (recommended)
+    python export_chats.py --no-page-load # faster on large, throttled accounts
     python export_chats.py --csv my.csv   # export a specific list instead
     python export_chats.py --rediscover   # refresh chats.csv from the account
+    python export_chats.py --rerender     # rebuild Markdown offline from saved JSON
 
 The chat list is saved to chats.csv on first run and reused afterwards, so
 folder numbering stays stable. Re-running skips chats already exported —
