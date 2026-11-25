@@ -816,11 +816,17 @@ def message_to_markdown(msg, local=None):
         body = f"```{lang}\n{content.get('text', '')}\n```"
     elif ct == "execution_output":
         body = f"```\n{content.get('text', '')}\n```"
-    elif ct == "thoughts":
-        body = "\n\n".join(
-            f"> {t.get('summary', '')}: {t.get('content', '')}"
-            for t in content.get("thoughts") or []
-        )
+    elif ct in ("thoughts", "reasoning_recap"):
+        # the model's reasoning: its own "## Thinking" section, which the
+        # viewer hides until asked
+        if ct == "thoughts":
+            body = "\n\n".join(
+                f"> {t.get('summary', '')}: {t.get('content', '')}"
+                for t in content.get("thoughts") or []
+            )
+        else:
+            body = f"*{content.get('content') or 'Thought'}*"
+        return f"## Thinking\n\n{body}" if body.strip() else None
     elif ct == "tether_quote":
         body = f"> {content.get('title', '')}\n> {content.get('text', '')}"
     else:

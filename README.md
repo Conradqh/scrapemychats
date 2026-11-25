@@ -35,7 +35,11 @@ export/
 The viewer is a single self-contained HTML file: instant full-text search
 across all chats, optional Personal/Work categorisation, inline image
 thumbnails, keyboard navigation. No server, no internet, no dependencies —
-it works from a USB stick.
+it works from a USB stick. The model's thinking and tool steps (web
+searches, plugin results, code output) are hidden by default; a
+"Show thinking & tool steps" button on each chat reveals them. (For chats
+exported with an older version, run `python export_chats.py --rerender`
+first so thinking is labelled separately from answers.)
 
 ![Searching the archive — instant full-text search with highlighted matches](docs/viewer-search.png)
 *Full-text search is instant and highlights matches in the results and inside the open chat. (Sample data shown.)*
@@ -254,7 +258,8 @@ re-run; regeneration takes seconds.
   viewer.
 - **Projects and custom GPTs appear in the viewer's sidebar.** Each chat
   records which ChatGPT Project (or custom GPT) it belongs to; the viewer
-  lists them under "Projects" and "Custom GPTs" with chat counts. Names come
+  lists them under "Projects" and "Custom GPTs" with chat counts (the number
+  beside each heading is the total chats in that section). Names come
   from `export/projects.json`, which discovery writes. If the sidebar shows
   IDs instead of names (e.g. an export made with an older version), run
   `python export_chats.py --list-projects` (about a minute; no chats are

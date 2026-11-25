@@ -256,7 +256,7 @@ body{
 .searchwrap input:focus{box-shadow:3px 3px 0 var(--red)}
 .searchwrap .hint{position:absolute;right:10px;top:50%;transform:translateY(-50%);
   font-family:var(--mono);font-size:10px;color:var(--ink3);border:1px solid var(--rule);padding:1px 5px}
-.frame{flex:1;display:grid;grid-template-columns:236px 400px 1fr;min-height:0}
+.frame{flex:1;display:grid;grid-template-columns:236px 400px 1fr;grid-template-rows:minmax(0,1fr);min-height:0}
 .rail{border-right:1px solid var(--rule);overflow-y:auto;padding:18px 0 30px}
 .rail .allbtn{margin:0 18px 14px}
 .grp{margin:16px 18px 4px;font-family:var(--mono);font-size:10px;letter-spacing:.22em;
@@ -321,6 +321,13 @@ body{
 .msg.user{background:var(--paper2);border-left:3px solid var(--red);
   padding:14px 18px 8px;margin:22px 0 6px}
 .msg.tool .body{font-size:12.5px;color:var(--ink2)}
+.msg.think .who{color:var(--ink3)}
+.msg.think .body{font-size:13.5px;color:var(--ink2)}
+.msg.step{border-left:2px dotted var(--rule);padding-left:14px}
+.doc:not(.showsteps) .msg.step{display:none}
+.stepsbtn{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;color:var(--red2);
+  background:none;border:1px solid var(--rule);padding:1px 8px;cursor:pointer}
+.stepsbtn:hover{background:var(--paper2)}
 .body{font-size:15.5px;line-height:1.62}
 .body>*{margin-bottom:.85em}
 .body h1,.body h2,.body h3,.body h4{font-family:var(--disp);line-height:1.25;margin-top:1.2em}
@@ -432,7 +439,7 @@ function buildRail(){
     const ps=(META.projects||[]).filter(p=>p.kind===kind);
     if(!ps.length) continue;
     const tot=ps.reduce((a,p)=>a+p.n,0);
-    h+=`<div class="grp"><span>${heading}</span><span class="gc">${tot}</span></div>`;
+    h+=`<div class="grp"><span>${heading}</span><span class="gc" title="${ps.length} ${heading.toLowerCase()}, ${tot} chats in total">${tot} chats</span></div>`;
     for(const p of ps){
       h+=`<button class="cat ${state.proj===p.id?'on':''}" data-p="${esc(p.id)}">${esc(p.name)} <span class="n">${p.n}</span></button>`;
     }
@@ -555,17 +562,21 @@ function open(c){
     const text=nl<0?'':p.slice(nl+1).trim();
     let role='assistant', who='ChatGPT';
     if(/^user$/i.test(head)){role='user';who='You';}
-    else if(/^tool/i.test(head)){role='tool';who=head;}
+    else if(/^tool/i.test(head)){role='tool step';who=head;}
+    else if(/^thinking$/i.test(head)){role='think step';who='ChatGPT · thinking';}
     else if(!/^assistant$/i.test(head)){role='assistant';who='ChatGPT';return {role,who,text:'## '+p};}
-    return {role,who,text};
+    // drop Markdown comments such as "[//]: # (bc:1)"
+    return {role,who,text:text.replace(/^\[\/\/\]: # \(.*\)[ \t]*$/gm,'').trim()};
   });
+  const nSteps=msgs.filter(m=>/\bstep\b/.test(m.role)).length;
+  const stepsBtn=nSteps?`<button class="stepsbtn" onclick="toggleSteps()">${showSteps?'Hide':'Show'} thinking &amp; tool steps (${nSteps})</button>`:'';
   const imgs=c.f.filter(f=>IMG_RE.test(f));
   const other=c.f.filter(f=>!IMG_RE.test(f));
   const strip = c.f.length?`<div class="filestrip">`+
       imgs.map(f=>`<img loading="lazy" src="${esc(encPath(f))}" onclick="lightbox(this.src)" title="${esc(f.split('/').pop())}">`).join('')+
       other.map(f=>`<a class="fchip" href="${esc(encPath(f))}" target="_blank">📎 ${esc(f.split('/').pop())}</a>`).join('')+
     `</div>`:'';
-  reader.innerHTML=`<div class="doc">
+  reader.innerHTML=`<div class="doc${showSteps?' showsteps':''}">
     <button class="back" onclick="closeReader()">&larr; back to list</button>
     <div class="dochead">
       <div class="stamps">${stamp(c,c.g)}${c.s!==c.g?stamp(c,c.s):''}</div>
@@ -574,6 +585,7 @@ function open(c){
         <span>${c.d||'undated'}</span><span>${c.n} messages</span>
         ${/^https?:\/\/[^"'<>\s]+$/.test(c.u)?`<a href="${esc(c.u)}" target="_blank" rel="noopener">original ↗</a>`:''}
         <a href="${esc(encPath(c.id))}/" target="_blank">folder ↗</a>
+        ${stepsBtn}
       </div>
     </div>
     ${strip}
@@ -583,6 +595,17 @@ function open(c){
   reader.scrollTop=0;
   const q=state.q.trim();
   if(q) highlight(reader.querySelectorAll('.body'),q);
+}
+/* thinking and tool steps: hidden by default; the choice is remembered */
+let showSteps=false;
+try{showSteps=localStorage.getItem('showSteps')==='1'}catch(e){}
+function toggleSteps(){
+  showSteps=!showSteps;
+  try{localStorage.setItem('showSteps',showSteps?'1':'0')}catch(e){}
+  const doc=document.querySelector('#reader .doc'); if(!doc) return;
+  doc.classList.toggle('showsteps',showSteps);
+  const b=doc.querySelector('.stepsbtn');
+  if(b) b.textContent=b.textContent.replace(/^(Show|Hide)/,showSteps?'Hide':'Show');
 }
 function closeReader(){document.getElementById('reader').classList.remove('open')}
 function highlight(nodes,q){
