@@ -218,14 +218,45 @@ def capture_auth(page, reload=False):
     return auth_headers_from(resp_info.value.request.headers)
 
 
+_last_refresh = [0.0]
+REFRESH_MIN_INTERVAL_S = 60
+
+
+def refresh_auth(page, headers):
+    """After a 401: re-capture the auth headers and update `headers` in place,
+    so every caller sharing that dict gets the new token. At most once per
+    REFRESH_MIN_INTERVAL_S (an endpoint that keeps answering 401 mustn't
+    trigger a reload per request). Returns True if the headers were refreshed."""
+    now = time.monotonic()
+    if now - _last_refresh[0] < REFRESH_MIN_INTERVAL_S:
+        return False
+    _last_refresh[0] = now
+    try:
+        new = capture_auth(page, reload=True)
+    except Exception as e:  # noqa: BLE001 - keep the run going
+        log(f"  ! could not refresh login headers: {e}")
+        return False
+    if not new:
+        return False
+    log("  login token refreshed")
+    headers.clear()
+    headers.update(new)
+    return True
+
+
 def api_get(page, api, headers):
-    """GET with automatic 60s wait on throttling."""
+    """GET with automatic 60s wait on throttling and one auth refresh on 401."""
+    refreshed = False
     while True:
         res = fetch_with_session(page, api, headers)
         if res["status"] == 429:
             log("  throttled while listing, waiting 60s...")
             time.sleep(60)
             continue
+        if res["status"] == 401 and not refreshed:
+            refreshed = True
+            if refresh_auth(page, headers):
+                continue
         return res
 
 
@@ -917,7 +948,7 @@ def download_sandbox_files(page, context, cid, refs, files_dir, auth_headers, er
 def fetch_library(page, auth_headers):
     """Page through the account file Library: returns
     [{file_id, file_name, origination_thread_id}, ...]."""
-    items, cursor = [], None
+    items, cursor, refreshed = [], None, False
     while True:
         body = {"cursor": cursor} if cursor else {}
         res = page.evaluate(
@@ -930,6 +961,10 @@ def fetch_library(page, auth_headers):
             }""",
             {"headers": auth_headers, "body": body},
         )
+        if res["status"] == 401 and not refreshed:
+            refreshed = True
+            if refresh_auth(page, auth_headers):
+                continue
         if res["status"] != 200:
             log(f"  ! library listing failed (HTTP {res['status']})")
             break
@@ -1428,9 +1463,16 @@ def main():
                 time.sleep(pause)
             time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
 
-        library_sweep(page, context, args.out,
-                      last_auth or capture_auth(page), gerr,
-                      limit_files=args.limit_files)
+        sweep_auth = last_auth
+        if not sweep_auth:
+            try:
+                sweep_auth = capture_auth(page)
+            except Exception as e:  # noqa: BLE001 - don't lose the summary
+                log(f"  ! skipping the Library sweep: could not get login headers ({e})")
+                gerr(f"[library] sweep skipped: could not get login headers ({e})")
+        if sweep_auth:
+            library_sweep(page, context, args.out, sweep_auth, gerr,
+                          limit_files=args.limit_files)
         context.close()
 
     log("")
