@@ -38,6 +38,7 @@ import random
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -145,12 +146,75 @@ def is_cloudflare_challenge(res):
 # ---------------------------------------------------------------- discovery
 
 
-def capture_auth(page):
-    """Load the homepage and copy the auth headers the frontend itself uses."""
+def _session_expired(s):
+    """True if a session JSON reports a refresh error or a past expiry."""
+    if s.get("error"):
+        return True
+    exp = s.get("expires")
+    if isinstance(exp, str) and exp:
+        try:
+            when = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return when <= datetime.now(timezone.utc)
+        except ValueError:
+            return False
+    return False
+
+
+def _session_auth(page):
+    """Auth headers from /api/auth/session, or None if it has no usable token.
+
+    The workspace comes from the _account cookie, which is what the frontend
+    uses for the workspace the user switched to; the session's own account id
+    is the fallback."""
+    s = session_state(page)
+    if not isinstance(s, dict) or _session_expired(s):
+        return None
+    token = s.get("accessToken")
+    if not (isinstance(token, str) and token):
+        return None
+    auth = {"Authorization": f"Bearer {token}"}
+    acct = None
+    try:
+        for c in page.context.cookies(BASE_URL):
+            if c.get("name") == "_account" and c.get("value"):
+                acct = c["value"]
+                break
+    except Exception:
+        pass
+    if not acct and isinstance(s.get("account"), dict):
+        acct = s["account"].get("id")
+    if isinstance(acct, str) and acct:
+        auth["chatgpt-account-id"] = acct
+    return auth
+
+
+def capture_auth(page, reload=False):
+    """Return the auth headers the ChatGPT frontend uses.
+
+    Preferred: build them from /api/auth/session (accessToken + workspace id),
+    which doesn't depend on the page issuing any particular request. Fallback:
+    load the homepage and copy the headers from its own conversation-list
+    request (this timed out after a fresh login in Nov 2026).
+    reload=True reloads the homepage first, so the frontend refreshes the
+    session (used after a 401)."""
+    if reload or not page.url.startswith(BASE_URL):
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    for attempt in range(3):
+        auth = _session_auth(page)
+        if auth:
+            return auth
+        # the page may still be redirecting, which makes evaluate() fail
+        try:
+            page.wait_for_load_state("load", timeout=NAV_TIMEOUT_MS)
+        except PWTimeout:
+            pass
+        time.sleep(2)
     with page.expect_response(
         lambda r: "/backend-api/conversations?" in r.url, timeout=NAV_TIMEOUT_MS
     ) as resp_info:
-        page.goto(BASE_URL, wait_until="domcontentloaded")
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     return auth_headers_from(resp_info.value.request.headers)
 
 
@@ -1128,8 +1192,9 @@ def capture_conversation(page, url, cid, auth, load_page=True):
     api = f"{BASE_URL}/backend-api/conversation/{cid}"
     res = fetch_with_session(page, api, auth)
     if res["status"] == 401:
-        # access token expired: re-capture from the homepage and retry once
-        auth = capture_auth(page)
+        # access token expired: reload the homepage so the frontend refreshes
+        # the session, re-read the headers, and retry once
+        auth = capture_auth(page, reload=True)
         res = fetch_with_session(page, api, auth)
     if is_cloudflare_challenge(res):
         return None, auth, "challenge"
@@ -1243,8 +1308,8 @@ def main():
             return
 
         # auth headers for conversation fetches: reuse discovery's; otherwise
-        # captured lazily inside the retry loop (a Cloudflare check or slow
-        # homepage then retries instead of aborting the run)
+        # captured lazily inside the retry loop (a Cloudflare check or a
+        # failed capture then retries instead of aborting the run)
         conv_auth = None
         if args.rediscover or not args.csv.exists():
             conv_auth = discover_chats(page, args.csv, args.out)
