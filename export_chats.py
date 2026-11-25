@@ -5,16 +5,20 @@ For ChatGPT accounts where the built-in "export data" button is unavailable
 Playwright using a persistent profile, so you log into ChatGPT once and every
 later run is automatic. Your data never leaves your machine.
 
-How it works: when the browser opens a chat, the ChatGPT page itself requests
-the full conversation JSON from its backend. This script captures that
-response (so it never needs to touch your credentials), renders it to
-Markdown, and downloads every referenced file/image using the same session.
+How it works: from inside the logged-in ChatGPT page, the script requests
+each conversation's JSON from ChatGPT's backend with the same auth headers
+the page itself uses (so it never needs your credentials). By default it
+opens each chat's page first; with --no-page-load it fetches directly from
+the page already open. It renders each chat to Markdown and downloads every
+referenced file/image using the same session.
 
 Usage:
     python export_chats.py                 # discover all chats, export them all
     python export_chats.py --limit 3      # small test run first (recommended)
+    python export_chats.py --no-page-load # faster on large, throttled accounts
     python export_chats.py --csv my.csv   # export a specific list instead
     python export_chats.py --rediscover   # refresh chats.csv from the account
+    python export_chats.py --rerender     # rebuild Markdown offline from saved JSON
 
 The chat list is saved to chats.csv on first run and reused afterwards, so
 folder numbering stays stable. Re-running skips chats already exported —
@@ -28,11 +32,13 @@ throttled, and permanently slows down each time it happens. A large archive
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -117,32 +123,140 @@ def fetch_with_session(page, api_url, headers):
             const r = await fetch(url, {headers});
             let body = null;
             try { body = await r.text(); } catch (e) {}
-            return {status: r.status, body};
+            return {status: r.status, body,
+                    cf: r.headers.get('cf-mitigated') || '',
+                    ctype: r.headers.get('content-type') || ''};
         }""",
         {"url": api_url, "headers": headers},
     )
 
 
+def is_cloudflare_challenge(res):
+    """A Cloudflare check answers API calls with 403 and an HTML page (and
+    usually a cf-mitigated header) — not a rate limit."""
+    if res.get("status") != 403:
+        return False
+    if (res.get("cf") or "").lower() == "challenge":
+        return True
+    body = (res.get("body") or "")[:3000].lower()
+    return "html" in (res.get("ctype") or "").lower() and (
+        "cloudflare" in body or "challenge" in body or "just a moment" in body)
+
+
 # ---------------------------------------------------------------- discovery
 
 
-def capture_auth(page):
-    """Load the homepage and copy the auth headers the frontend itself uses."""
+def _session_expired(s):
+    """True if a session JSON reports a refresh error or a past expiry."""
+    if s.get("error"):
+        return True
+    exp = s.get("expires")
+    if isinstance(exp, str) and exp:
+        try:
+            when = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return when <= datetime.now(timezone.utc)
+        except ValueError:
+            return False
+    return False
+
+
+def _session_auth(page):
+    """Auth headers from /api/auth/session, or None if it has no usable token.
+
+    The workspace comes from the _account cookie, which is what the frontend
+    uses for the workspace the user switched to; the session's own account id
+    is the fallback."""
+    s = session_state(page)
+    if not isinstance(s, dict) or _session_expired(s):
+        return None
+    token = s.get("accessToken")
+    if not (isinstance(token, str) and token):
+        return None
+    auth = {"Authorization": f"Bearer {token}"}
+    acct = None
+    try:
+        for c in page.context.cookies(BASE_URL):
+            if c.get("name") == "_account" and c.get("value"):
+                acct = c["value"]
+                break
+    except Exception:
+        pass
+    if not acct and isinstance(s.get("account"), dict):
+        acct = s["account"].get("id")
+    if isinstance(acct, str) and acct:
+        auth["chatgpt-account-id"] = acct
+    return auth
+
+
+def capture_auth(page, reload=False):
+    """Return the auth headers the ChatGPT frontend uses.
+
+    Preferred: build them from /api/auth/session (accessToken + workspace id),
+    which doesn't depend on the page issuing any particular request. Fallback:
+    load the homepage and copy the headers from its own conversation-list
+    request (this timed out after a fresh login in Nov 2026).
+    reload=True reloads the homepage first, so the frontend refreshes the
+    session (used after a 401)."""
+    if reload or not page.url.startswith(BASE_URL):
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    for attempt in range(3):
+        auth = _session_auth(page)
+        if auth:
+            return auth
+        # the page may still be redirecting, which makes evaluate() fail
+        try:
+            page.wait_for_load_state("load", timeout=NAV_TIMEOUT_MS)
+        except PWTimeout:
+            pass
+        time.sleep(2)
     with page.expect_response(
         lambda r: "/backend-api/conversations?" in r.url, timeout=NAV_TIMEOUT_MS
     ) as resp_info:
-        page.goto(BASE_URL, wait_until="domcontentloaded")
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     return auth_headers_from(resp_info.value.request.headers)
 
 
+_last_refresh = [0.0]
+REFRESH_MIN_INTERVAL_S = 60
+
+
+def refresh_auth(page, headers):
+    """After a 401: re-capture the auth headers and update `headers` in place,
+    so every caller sharing that dict gets the new token. At most once per
+    REFRESH_MIN_INTERVAL_S (an endpoint that keeps answering 401 mustn't
+    trigger a reload per request). Returns True if the headers were refreshed."""
+    now = time.monotonic()
+    if now - _last_refresh[0] < REFRESH_MIN_INTERVAL_S:
+        return False
+    _last_refresh[0] = now
+    try:
+        new = capture_auth(page, reload=True)
+    except Exception as e:  # noqa: BLE001 - keep the run going
+        log(f"  ! could not refresh login headers: {e}")
+        return False
+    if not new:
+        return False
+    log("  login token refreshed")
+    headers.clear()
+    headers.update(new)
+    return True
+
+
 def api_get(page, api, headers):
-    """GET with automatic 60s wait on throttling."""
+    """GET with automatic 60s wait on throttling and one auth refresh on 401."""
+    refreshed = False
     while True:
         res = fetch_with_session(page, api, headers)
         if res["status"] == 429:
             log("  throttled while listing, waiting 60s...")
             time.sleep(60)
             continue
+        if res["status"] == 401 and not refreshed:
+            refreshed = True
+            if refresh_auth(page, headers):
+                continue
         return res
 
 
@@ -174,8 +288,9 @@ def discover_main(page, headers):
     ]
 
 
-def discover_projects(page, headers):
-    """Enumerate Projects and every conversation inside each of them."""
+def list_projects(page, headers):
+    """[(project id, name)] for every Project in the account, or None if the
+    listing failed."""
     projects, cursor = [], None
     while True:
         api = f"{BASE_URL}/backend-api/gizmos/snorlax/sidebar"
@@ -184,7 +299,7 @@ def discover_projects(page, headers):
         res = api_get(page, api, headers)
         if res["status"] != 200:
             log(f"  ! project listing failed (HTTP {res['status']}), skipping projects")
-            return []
+            return None
         data = json.loads(res["body"])
         for it in data.get("items") or []:
             g = it.get("gizmo") or {}
@@ -198,7 +313,15 @@ def discover_projects(page, headers):
         if not cursor or not data.get("items"):
             break
         time.sleep(random.uniform(1, 2))
+    return projects
 
+
+def discover_projects(page, headers):
+    """Enumerate Projects and every conversation inside each of them.
+    Returns (chats, projects)."""
+    projects = list_projects(page, headers)
+    if projects is None:
+        return [], None
     chats = []
     for gid, name in projects:
         got, page_cursor = 0, 0
@@ -225,10 +348,57 @@ def discover_projects(page, headers):
             page_cursor = nxt
             time.sleep(random.uniform(1, 2))
         log(f"  project {name!r}: {got} conversations")
-    return chats
+    return chats, projects
 
 
-def discover_chats(page, csv_path):
+def save_names(out_dir, projects=None, gpts=None):
+    """Merge {id: name} maps into out_dir/projects.json, which the viewer
+    uses to group chats by Project / custom GPT."""
+    path = out_dir / "projects.json"
+    try:
+        cur = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cur = {}
+    for key, new in (("projects", projects), ("gpts", gpts)):
+        if new:
+            cur.setdefault(key, {}).update(new)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cur, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path
+
+
+def exported_gpt_ids(out_dir):
+    """Custom-GPT ids referenced by already-exported chats."""
+    ids = set()
+    for p in out_dir.glob("*/conversation.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if d.get("gizmo_type") == "gpt" and d.get("gizmo_id"):
+            ids.add(d["gizmo_id"])
+    return ids
+
+
+def list_gpt_names(page, headers, gids):
+    """{gpt id: name}, best effort (unknown or deleted GPTs are skipped)."""
+    names = {}
+    for gid in sorted(gids):
+        try:
+            res = api_get(page, f"{BASE_URL}/backend-api/gizmos/{gid}", headers)
+            if res["status"] == 200:
+                d = json.loads(res["body"])
+                g = d.get("gizmo") or d
+                name = (g.get("display") or {}).get("name")
+                if name:
+                    names[gid] = name
+        except Exception:
+            pass
+        time.sleep(random.uniform(1, 2))
+    return names
+
+
+def discover_chats(page, csv_path, out_dir=None):
     """Discover all conversations (main sidebar + every project) and merge
     them into csv_path, preserving existing rows and their order so that
     export folder numbering stays stable across runs."""
@@ -236,7 +406,10 @@ def discover_chats(page, csv_path):
     headers = capture_auth(page)
     found = discover_main(page, headers)
     log("Discovering project conversations...")
-    found += discover_projects(page, headers)
+    pchats, projects = discover_projects(page, headers)
+    found += pchats
+    if projects and out_dir:
+        save_names(out_dir, projects=dict(projects))
 
     existing_rows, existing_ids = [], set()
     if csv_path.exists():
@@ -259,6 +432,7 @@ def discover_chats(page, csv_path):
         w.writerow(["url", "title"])
         w.writerows(existing_rows + new_rows)
     log(f"{csv_path}: kept {len(existing_rows)} existing, added {len(new_rows)} new")
+    return headers
 
 
 def read_chat_list(csv_path):
@@ -316,7 +490,297 @@ def part_to_text(part):
     return ""
 
 
-def message_to_markdown(msg):
+# ----------------------------------------------- rich ("genui") answers
+#
+# Newer ChatGPT answers with photo cards, place names or maps store layout
+# code (JSX-like markup) as the message text, plus metadata.model_dil_v2:
+#   fallbackMarkdown  - ChatGPT's own plain-Markdown rendering, with inline
+#                       tokens  \ue200TYPE\ue202ARG\ue202ARG...\ue201
+#   appData.opGenui.componentResults - resolved image searches (AsyncImage)
+# We render fallbackMarkdown, expand its tokens, and save the images locally.
+
+GENUI_TOKEN_RE = re.compile("\ue200([A-Za-z0-9_]+)\ue202(.*?)\ue201", re.S)
+INVISIBLE_TOKENS = ("cite", "filecite")  # citation markers: dropped
+GENUI_IMG_PREFIX = "genui_"
+IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png",
+             "image/webp": ".webp", "image/gif": ".gif"}
+
+
+def _dil(msg):
+    d = (msg.get("metadata") or {}).get("model_dil_v2")
+    return d if isinstance(d, dict) else None
+
+
+def _as_dict(v):
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else []
+
+
+def message_genui_images(msg):
+    """{image search query: [image dict, ...]} for one message's resolved
+    AsyncImage results (deduplicated within each query only)."""
+    dil = _dil(msg)
+    if not dil:
+        return {}
+    results = _as_dict(_as_dict(_as_dict(dil.get("appData")).get("opGenui"))
+                       .get("componentResults"))
+    idx = {}
+    for r in results.values():
+        r = _as_dict(r)
+        if r.get("componentName") != "AsyncImage":
+            continue
+        for im in _as_list(_as_dict(r.get("state")).get("images")):
+            if not isinstance(im, dict):
+                continue
+            q, stem = im.get("image_search_query"), genui_image_stem(im)
+            if isinstance(q, str) and q and stem:
+                lst = idx.setdefault(q, [])
+                if all(genui_image_stem(x) != stem for x in lst):
+                    lst.append(im)
+    return idx
+
+
+def genui_images(data):
+    """Every resolved image in the chat, one entry per distinct image."""
+    out, seen = [], set()
+    for node in _as_dict(data.get("mapping")).values():
+        msg = _as_dict(_as_dict(node).get("message"))
+        for imgs in message_genui_images(msg).values():
+            for im in imgs:
+                stem = genui_image_stem(im)
+                if stem not in seen:
+                    seen.add(stem)
+                    out.append(im)
+    return out
+
+
+def genui_image_stem(im):
+    """Stable local file name (without extension) for a resolved image."""
+    key = (im.get("content_url") or im.get("thumbnail_url")
+           or im.get("original_content_url") or "")
+    if not isinstance(key, str) or not key:
+        return ""
+    return GENUI_IMG_PREFIX + hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def local_genui_files(files_dir):
+    """{stem: file name} of genui images already saved in files_dir."""
+    if not files_dir or not files_dir.is_dir():
+        return {}
+    return {f.stem: f.name for f in files_dir.iterdir()
+            if f.name.startswith(GENUI_IMG_PREFIX)}
+
+
+def download_genui_images(fetch, data, files_dir, err):
+    """Save every resolved image of the chat into files_dir.
+    fetch(url) -> (status, content_type, body_bytes)."""
+    have = local_genui_files(files_dir)
+    ok = failed = 0
+    for im in genui_images(data):
+        stem = genui_image_stem(im)
+        if stem in have:
+            continue
+        saved = False
+        for u in (im.get("content_url"), im.get("thumbnail_url"),
+                  im.get("original_content_url")):
+            if not isinstance(u, str) or not u.startswith("https://"):
+                continue
+            try:
+                status, ctype, body = fetch(u)
+            except Exception as e:
+                err(f"image {u[:80]}: {type(e).__name__}: {e}")
+                continue
+            ctype = (ctype or "").split(";")[0].strip().lower()
+            if status == 200 and ctype in IMAGE_EXT and body:
+                files_dir.mkdir(parents=True, exist_ok=True)
+                (files_dir / (stem + IMAGE_EXT[ctype])).write_bytes(body)
+                saved = True
+                break
+        if saved:
+            ok += 1
+        else:
+            failed += 1
+            err(f"image for '{im.get('image_search_query', '')}': no source downloadable")
+    return ok, failed
+
+
+def playwright_fetcher(context):
+    def fetch(url):
+        r = context.request.get(url, timeout=30_000)
+        return r.status, r.headers.get("content-type", ""), r.body()
+    return fetch
+
+
+def urllib_fetch(url):
+    """Download without a browser. Falls back to the system curl when
+    Python can't verify HTTPS certificates (common on python.org builds for
+    macOS that never ran 'Install Certificates.command')."""
+    import ssl
+    from urllib.error import URLError
+    from urllib.request import Request, urlopen
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(req, timeout=30, context=ctx) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read()
+    except URLError as e:
+        if not isinstance(getattr(e, "reason", None), ssl.SSLError):
+            raise
+        return curl_fetch(url)
+
+
+def curl_fetch(url):
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "body"
+        r = subprocess.run(
+            ["curl", "-sS", "-L", "--max-time", "30", "-A", "Mozilla/5.0",
+             "-o", str(out), "-w", "%{http_code} %{content_type}", url],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"curl failed: {r.stderr.strip()[:200]}")
+        code, _, ctype = r.stdout.strip().partition(" ")
+        return int(code or 0), ctype, out.read_bytes() if out.exists() else b""
+
+
+# One pass over the text: protected spans (fenced code, genui tokens, inline
+# code, 4-space/tab-indented lines) are copied unchanged; elsewhere '#'/'##'
+# headings are demoted and harmless backslash escapes removed.
+_FALLBACK_RE = re.compile(
+    r"(?P<keep>"
+    r"^[ \t]*(?P<f>`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*(?P=f)[ \t]*$|\Z)"
+    "|\ue200.*?\ue201"
+    r"|`[^`\n]*`"
+    r"|^(?: {4}|\t)[^\n]*"
+    r")"
+    r"|(?P<h>^#{1,2} )"
+    r"|\\(?P<e>[.:()!])",
+    re.M | re.S,
+)
+
+
+def clean_fallback(md):
+    """Adapt ChatGPT's fallback Markdown to conversation.md conventions:
+    demote '#'/'##' headings (a line starting '## ' marks a new message in
+    conversation.md and the viewer) and drop backslash escapes of harmless
+    punctuation ('1\\.' -> '1.'). Code and tokens are left alone."""
+    def repl(m):
+        if m.group("keep") is not None:
+            return m.group("keep")
+        if m.group("h") is not None:
+            return "### "
+        return m.group("e")
+    return _FALLBACK_RE.sub(repl, md)
+
+
+def _md_text(s):
+    """Make a string safe as Markdown link/alt text."""
+    return re.sub(r"[\[\]\n\r]+", " ", s or "").strip()
+
+
+def _map_coords(msg):
+    """{place name: (lat, lon)} from the message's resolved map widgets."""
+    coords = {}
+    for ref in (msg.get("metadata") or {}).get("content_references") or []:
+        if isinstance(ref, dict) and ref.get("category") == "map":
+            for p in (ref.get("data") or {}).get("points") or []:
+                if p.get("name") and p.get("latitude") is not None:
+                    coords[p["name"]] = (p["latitude"], p.get("longitude"))
+    return coords
+
+
+def expand_genui_tokens(text, msg, images, local):
+    """Replace \\ue200...\\ue201 tokens with plain Markdown."""
+    from urllib.parse import quote
+
+    def image_md(im, alt):
+        name = local.get(genui_image_stem(im))
+        page = im.get("url") or ""
+        src = f" [source]({page})" if page.startswith("http") else ""
+        if name:
+            return f"![{alt}](files/{name}){src}"
+        if page.startswith("http"):
+            return f"[🖼 {alt}]({page})"
+        return f"[image: {alt}]"
+
+    coords = None
+
+    def readable(kind, args):
+        """Fallback for unknown or unparsable tokens: keep the first argument
+        that looks like visible text rather than silently dropping it."""
+        for a in args:
+            a = a.strip()
+            if a and not a.startswith(("{", "[")) and not re.fullmatch(
+                    r"turn\d+[a-z_]+\d+", a):
+                return a
+        return f"[{kind}]"
+
+    def repl(m):
+        nonlocal coords
+        kind, args = m.group(1), m.group(2).split("\ue202")
+        try:
+            if kind in INVISIBLE_TOKENS:
+                return ""
+            if kind == "url":
+                if len(args) >= 2 and args[-1].startswith("http"):
+                    return f"[{_md_text(args[0])}]({args[-1]})"
+                return args[0]
+            if kind == "entity":
+                v = json.loads(args[0])
+                if isinstance(v, list):
+                    return str(v[1] if len(v) > 1 else v[0])
+                return str(v)
+            if kind == "image_group":
+                spec = json.loads(args[0])
+                queries = spec.get("query") or []
+                if isinstance(queries, str):
+                    queries = [queries]
+                n = int(spec.get("num_per_query") or 1)
+                out = []
+                for q in queries:
+                    found = images.get(q) or []
+                    out += [image_md(im, _md_text(q)) for im in found[:n]]
+                    if not found:
+                        out.append(f"[image: {_md_text(q)}]")
+                return " ".join(out)
+            if kind == "genui":
+                spec = json.loads(args[0])
+                mw = spec.get("map_widget_v2") if isinstance(spec, dict) else None
+                if isinstance(mw, dict):
+                    if coords is None:
+                        coords = _map_coords(msg)
+                    lines = []
+                    for p in mw.get("points") or []:
+                        name, addr = p.get("name") or "", p.get("address") or ""
+                        ll = coords.get(name)
+                        if ll and ll[1] is not None:
+                            link = (f"https://www.openstreetmap.org/?mlat={ll[0]}"
+                                    f"&mlon={ll[1]}#map=17/{ll[0]}/{ll[1]}")
+                        else:
+                            link = ("https://www.openstreetmap.org/search?query="
+                                    + quote(addr or name))
+                        label = f"**{_md_text(name)}**" + (f" — {addr}" if addr else "")
+                        lines.append(f"- {label} ([map]({link}))")
+                    return "\n\n" + "\n".join(lines) + "\n\n"
+                names = ", ".join(spec) if isinstance(spec, dict) else "widget"
+                return f"[interactive widget: {names}]"
+        except Exception:
+            pass
+        return readable(kind, args)
+
+    return GENUI_TOKEN_RE.sub(repl, text)
+
+
+def message_to_markdown(msg, local=None):
+    """local: {stem: file name} of rich-answer images saved in files/."""
     meta = msg.get("metadata") or {}
     if meta.get("is_visually_hidden_from_conversation"):
         return None
@@ -332,19 +796,37 @@ def message_to_markdown(msg):
         return None
 
     if ct in ("text", "multimodal_text"):
-        body = "\n\n".join(
-            t for t in (part_to_text(p) for p in content.get("parts") or []) if t
-        )
+        dil = _dil(msg)
+        fallback = dil.get("fallbackMarkdown") if dil else None
+        if isinstance(fallback, str) and fallback.strip():
+            # rich answer: parts hold layout code; use ChatGPT's own Markdown
+            body = clean_fallback(fallback)
+        else:
+            body = "\n\n".join(
+                t for t in (part_to_text(p) for p in content.get("parts") or []) if t
+            )
+        if "\ue200" in body:
+            try:
+                body = expand_genui_tokens(
+                    body, msg, message_genui_images(msg), local or {})
+            except Exception:  # keep the text rather than lose the chat
+                body = GENUI_TOKEN_RE.sub(" ", body)
     elif ct == "code":
         lang = content.get("language") or ""
         body = f"```{lang}\n{content.get('text', '')}\n```"
     elif ct == "execution_output":
         body = f"```\n{content.get('text', '')}\n```"
-    elif ct == "thoughts":
-        body = "\n\n".join(
-            f"> {t.get('summary', '')}: {t.get('content', '')}"
-            for t in content.get("thoughts") or []
-        )
+    elif ct in ("thoughts", "reasoning_recap"):
+        # the model's reasoning: its own "## Thinking" section, which the
+        # viewer hides until asked
+        if ct == "thoughts":
+            body = "\n\n".join(
+                f"> {t.get('summary', '')}: {t.get('content', '')}"
+                for t in content.get("thoughts") or []
+            )
+        else:
+            body = f"*{content.get('content') or 'Thought'}*"
+        return f"## Thinking\n\n{body}" if body.strip() else None
     elif ct == "tether_quote":
         body = f"> {content.get('title', '')}\n> {content.get('text', '')}"
     else:
@@ -362,7 +844,9 @@ def message_to_markdown(msg):
     return f"## {header}\n\n{body}"
 
 
-def render_markdown(data, url, title):
+def render_markdown(data, url, title, files_dir=None):
+    """files_dir: the chat's files/ folder, used to link saved images."""
+    local = local_genui_files(files_dir)
     lines = [f"# {data.get('title') or title}", "", f"- URL: {url}"]
     for key in ("create_time", "update_time"):
         ts = data.get(key)
@@ -373,7 +857,7 @@ def render_markdown(data, url, title):
             )
     lines.append("")
     for msg in ordered_messages(data):
-        md = message_to_markdown(msg)
+        md = message_to_markdown(msg, local)
         if md:
             lines += [md, ""]
     return "\n".join(lines)
@@ -470,7 +954,7 @@ def download_sandbox_files(page, context, cid, refs, files_dir, auth_headers, er
 def fetch_library(page, auth_headers):
     """Page through the account file Library: returns
     [{file_id, file_name, origination_thread_id}, ...]."""
-    items, cursor = [], None
+    items, cursor, refreshed = [], None, False
     while True:
         body = {"cursor": cursor} if cursor else {}
         res = page.evaluate(
@@ -483,6 +967,10 @@ def fetch_library(page, auth_headers):
             }""",
             {"headers": auth_headers, "body": body},
         )
+        if res["status"] == 401 and not refreshed:
+            refreshed = True
+            if refresh_auth(page, auth_headers):
+                continue
         if res["status"] != 200:
             log(f"  ! library listing failed (HTTP {res['status']})")
             break
@@ -496,15 +984,12 @@ def fetch_library(page, auth_headers):
     return items
 
 
-def library_sweep(page, context, out_dir, auth_headers, err):
+def library_sweep(page, context, out_dir, auth_headers, err, limit_files=False):
     """Download every Library file into the folder of the chat it came from
     (or export/_library/ if the chat isn't exported). Uploaded files keep
     working under fresh Library ids even when their original chat-attachment
-    ids have gone stale."""
-    log("Sweeping the account file Library...")
-    items = fetch_library(page, auth_headers)
-    log(f"  {len(items)} files in library")
-
+    ids have gone stale. With limit_files, only files whose originating chat
+    has been exported are downloaded; nothing goes to export/_library/."""
     # map full conversation id -> exported folder via manifest.csv
     folder_by_cid = {}
     manifest = out_dir / "manifest.csv"
@@ -515,6 +1000,21 @@ def library_sweep(page, context, out_dir, auth_headers, err):
                     m = CONV_ID_RE.search(row[0])
                     if m:
                         folder_by_cid[m.group(1)] = row[2]
+
+    if limit_files and not folder_by_cid:
+        log("Library sweep skipped: no exported chats yet (--limit-files)")
+        return
+
+    log("Sweeping the account file Library...")
+    items = fetch_library(page, auth_headers)
+    if limit_files:
+        total = len(items)
+        items = [it for it in items
+                 if it.get("origination_thread_id") in folder_by_cid]
+        log(f"  {total} files in library; {len(items)} belong to exported chats "
+            f"({total - len(items)} skipped, --limit-files)")
+    else:
+        log(f"  {len(items)} files in library")
 
     ok = failed = skipped = 0
     for it in items:
@@ -662,21 +1162,89 @@ def fix_files(page, context, out_dir, auth, ef):
     log(f"fix-files: recovered {tot_ok} files, {tot_fail} still unavailable")
 
 
+def rerender(out_dir, ef):
+    """Rebuild conversation.md of every exported chat from its saved
+    conversation.json, downloading images of rich answers. No browser needed."""
+    folders = [f for f in sorted(out_dir.iterdir())
+               if f.is_dir() and (f / "conversation.json").exists()]
+    log(f"rerender: rebuilding {len(folders)} exported chats")
+    n_ok = n_bad = img_ok = img_fail = 0
+    for folder in folders:
+        def err(msg, _f=folder.name):
+            ef.write(f"[rerender {_f}]\n    {msg}\n")
+            ef.flush()
+        try:
+            data = json.loads((folder / "conversation.json").read_text(encoding="utf-8"))
+        except Exception as e:
+            log(f"  ! unreadable conversation.json in {folder.name}: {e}")
+            continue
+        url = ""
+        md_path = folder / "conversation.md"
+        if md_path.exists():
+            for ln in md_path.read_text(encoding="utf-8").split("\n")[:8]:
+                if ln.startswith("- URL: "):
+                    url = ln[7:].strip()
+        if not url and data.get("conversation_id"):
+            url = f"{BASE_URL}/c/{data['conversation_id']}"
+        try:
+            if genui_images(data):
+                ok, fail = download_genui_images(urllib_fetch, data, folder / "files", err)
+                img_ok += ok
+                img_fail += fail
+                if ok or fail:
+                    log(f"  {folder.name}: {ok} image(s) saved, {fail} unavailable")
+        except Exception as e:  # images are best-effort; still rebuild the text
+            err(f"rich-answer images: {type(e).__name__}: {e}")
+        try:
+            text = render_markdown(data, url, data.get("title") or folder.name,
+                                   folder / "files")
+            md_path.write_text(text, encoding="utf-8")
+            n_ok += 1
+        except Exception as e:
+            n_bad += 1
+            err(f"rerender failed: {type(e).__name__}: {e}")
+            log(f"  ! could not rebuild {folder.name}: {e}")
+    log(f"rerender: rebuilt {n_ok} chats"
+        + (f" ({n_bad} failed, see errors.log)" if n_bad else "")
+        + f"; images saved {img_ok}, unavailable {img_fail}")
+    if img_fail:
+        log("  (unavailable images are listed in errors.log)")
+
+
 # --------------------------------------------------------------- main loop
 
 
-def capture_conversation(page, url, cid):
-    """Navigate to the chat and capture the conversation JSON + auth headers."""
-    with page.expect_response(
-        lambda r: f"/backend-api/conversation/{cid}" in r.url
-        and r.request.method == "GET",
-        timeout=NAV_TIMEOUT_MS,
-    ) as resp_info:
-        page.goto(url, wait_until="domcontentloaded")
-    resp = resp_info.value
-    if resp.status != 200:
-        return None, None, resp.status
-    return resp.json(), auth_headers_from(resp.request.headers), 200
+def capture_conversation(page, url, cid, auth, load_page=True):
+    """Open the chat, then fetch its conversation JSON from inside the page.
+
+    ChatGPT's frontend no longer reliably issues GET
+    /backend-api/conversation/{cid} when a chat page loads (the content can
+    arrive embedded in the page instead), so waiting passively for that
+    request times out. We navigate (so the session looks normal) and then
+    request the JSON ourselves with the frontend's auth headers.
+    Returns (data, auth_headers, status); status is "challenge" when
+    Cloudflare is showing a check that the user must solve in the window.
+    With load_page=False the chat page isn't opened: the JSON is fetched from
+    whatever chatgpt.com page is already open (fewer requests per chat)."""
+    if not auth:
+        auth = capture_auth(page)
+    if load_page or not page.url.startswith(BASE_URL):
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    api = f"{BASE_URL}/backend-api/conversation/{cid}"
+    res = fetch_with_session(page, api, auth)
+    if res["status"] == 401:
+        # access token expired: reload the homepage so the frontend refreshes
+        # the session, re-read the headers, and retry once
+        auth = capture_auth(page, reload=True)
+        res = fetch_with_session(page, api, auth)
+    if is_cloudflare_challenge(res):
+        return None, auth, "challenge"
+    if res["status"] != 200:
+        return None, auth, res["status"]
+    try:
+        return json.loads(res["body"]), auth, 200
+    except (TypeError, ValueError):
+        return None, auth, "non-JSON response"
 
 
 def main():
@@ -697,6 +1265,22 @@ def main():
                     help="don't re-export conversations; instead revisit every "
                          "already-exported chat and fetch any missing attachments, "
                          "generated (code-tool) files, and Library files")
+    ap.add_argument("--rerender", action="store_true",
+                    help="don't contact ChatGPT; rebuild conversation.md of every "
+                         "already-exported chat from its conversation.json and "
+                         "download images shown in rich answers")
+    ap.add_argument("--list-projects", action="store_true",
+                    help="only fetch the names of your Projects and of custom "
+                         "GPTs used in exported chats (saved to "
+                         "export/projects.json for the viewer), then exit")
+    ap.add_argument("--no-page-load", action="store_true",
+                    help="don't open each chat's page in the browser; fetch its "
+                         "JSON directly from the open ChatGPT tab (fewer requests "
+                         "per chat, may reduce throttling)")
+    ap.add_argument("--limit-files", action="store_true",
+                    help="in the Library sweep, download only files that came "
+                         "from exported chats (default: the whole Library, "
+                         "with unmatched files saved to export/_library/)")
     ap.add_argument("--browser-channel", default="chrome",
                     choices=["chrome", "msedge"],
                     help="installed browser to drive (default: chrome)")
@@ -711,6 +1295,12 @@ def main():
     manifest_path = args.out / "manifest.csv"
     errors_path = args.out / "errors.log"
     new_manifest = not manifest_path.exists()
+
+    if args.rerender:
+        with open(errors_path, "a", encoding="utf-8") as ef:
+            rerender(args.out, ef)
+        log("Next: python build_viewer.py  (creates export/viewer.html)")
+        return
 
     exported = skipped = failed_n = 0
     extra_delay = 0.0  # grows every time the server throttles us
@@ -738,16 +1328,32 @@ def main():
             ef.write(f"{msg}\n")
             ef.flush()
 
+        if args.list_projects:
+            auth = capture_auth(page)
+            projects = list_projects(page, auth) or []
+            gpts = list_gpt_names(page, auth, exported_gpt_ids(args.out))
+            path = save_names(args.out, projects=dict(projects), gpts=gpts)
+            context.close()
+            log(f"{len(projects)} project name(s), {len(gpts)} custom GPT name(s) "
+                f"saved to {path}")
+            log("Next: python build_viewer.py")
+            return
+
         if args.fix_files:
             auth = capture_auth(page)
             fix_files(page, context, args.out, auth, ef)
-            library_sweep(page, context, args.out, auth, gerr)
+            library_sweep(page, context, args.out, auth, gerr,
+                          limit_files=args.limit_files)
             context.close()
             log("fix-files pass complete.")
             return
 
+        # auth headers for conversation fetches: reuse discovery's; otherwise
+        # captured lazily inside the retry loop (a Cloudflare check or a
+        # failed capture then retries instead of aborting the run)
+        conv_auth = None
         if args.rediscover or not args.csv.exists():
-            discover_chats(page, args.csv)
+            conv_auth = discover_chats(page, args.csv, args.out)
         chats = read_chat_list(args.csv)
         if args.limit:
             chats = chats[: args.limit]
@@ -769,9 +1375,24 @@ def main():
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
                 try:
-                    data, auth, status = capture_conversation(page, url, cid)
+                    data, auth, status = capture_conversation(
+                        page, url, cid, conv_auth, load_page=not args.no_page_load)
+                    conv_auth = auth
                     if status == 200:
                         break
+                    if status == "challenge":
+                        attempt += 1
+                        err(f"Cloudflare check on chat page (attempt {attempt})")
+                        if args.no_page_load:
+                            # show the check in the window so it can be solved
+                            try:
+                                page.goto(url, wait_until="domcontentloaded",
+                                          timeout=NAV_TIMEOUT_MS)
+                            except PWTimeout:
+                                pass
+                        log("    Cloudflare check: solve it in the Chrome window; retrying in 30s")
+                        time.sleep(30)
+                        continue
                     if status in (429, 403):
                         # throttled: cool down with escalating waits, don't
                         # count against normal retry attempts
@@ -787,7 +1408,7 @@ def main():
                     time.sleep(10)
                 except PWTimeout:
                     attempt += 1
-                    err(f"timeout waiting for conversation JSON (attempt {attempt})")
+                    err(f"timeout loading chat page (attempt {attempt})")
                     log("    timed out (Cloudflare check? solve it in the window if shown)")
                     time.sleep(15)
                 except Exception as e:
@@ -802,8 +1423,16 @@ def main():
                 continue
 
             folder.mkdir(parents=True, exist_ok=True)
+            try:
+                if genui_images(data):
+                    g_ok, g_fail = download_genui_images(
+                        playwright_fetcher(context), data, folder / "files", err)
+                    log(f"    {g_ok} image(s) from rich answers saved"
+                        + (f", {g_fail} unavailable" if g_fail else ""))
+            except Exception as e:  # never let images abort the export
+                err(f"rich-answer images: {type(e).__name__}: {e}")
             (folder / "conversation.md").write_text(
-                render_markdown(data, url, title), encoding="utf-8"
+                render_markdown(data, url, title, folder / "files"), encoding="utf-8"
             )
 
             refs = collect_file_refs(data)
@@ -840,8 +1469,16 @@ def main():
                 time.sleep(pause)
             time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
 
-        library_sweep(page, context, args.out,
-                      last_auth or capture_auth(page), gerr)
+        sweep_auth = last_auth
+        if not sweep_auth:
+            try:
+                sweep_auth = capture_auth(page)
+            except Exception as e:  # noqa: BLE001 - don't lose the summary
+                log(f"  ! skipping the Library sweep: could not get login headers ({e})")
+                gerr(f"[library] sweep skipped: could not get login headers ({e})")
+        if sweep_auth:
+            library_sweep(page, context, args.out, sweep_auth, gerr,
+                          limit_files=args.limit_files)
         context.close()
 
     log("")

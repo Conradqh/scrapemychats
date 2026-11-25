@@ -35,7 +35,11 @@ export/
 The viewer is a single self-contained HTML file: instant full-text search
 across all chats, optional Personal/Work categorisation, inline image
 thumbnails, keyboard navigation. No server, no internet, no dependencies —
-it works from a USB stick.
+it works from a USB stick. The model's thinking and tool steps (web
+searches, plugin results, code output) are hidden by default; a
+"Show thinking & tool steps" button on each chat reveals them. (For chats
+exported with an older version, run `python export_chats.py --rerender`
+first so thinking is labelled separately from answers.)
 
 ![Searching the archive — instant full-text search with highlighted matches](docs/viewer-search.png)
 *Full-text search is instant and highlights matches in the results and inside the open chat. (Sample data shown.)*
@@ -177,6 +181,33 @@ assistant drive:
 
 ---
 
+## All options
+
+`python export_chats.py [options]`
+
+| Option | What it does |
+|---|---|
+| *(none)* | Discover every chat (first run), export all not yet exported, then sweep the file Library |
+| `--limit N` | Export at most N chats. Good for a first test run (`--limit 3`) |
+| `--no-page-load` | Fetch each chat directly instead of opening its page first. Fewer requests; about 2½× faster once ChatGPT starts throttling. The Chrome window looks idle |
+| `--rediscover` | Refresh `chats.csv` from the account first (new chats are added; existing numbering is kept) |
+| `--csv FILE` | Use this chat list instead of `chats.csv` |
+| `--out DIR` | Output folder (default `export`) |
+| `--profile DIR` | Chrome profile folder holding the saved login (default `browser_profile`) |
+| `--browser-channel chrome\|msedge` | Which installed browser to drive (default `chrome`) |
+| `--limit-files` | In the Library sweep, download only files from exported chats (default: whole Library; unmatched files go to `export/_library/`) |
+| `--fix-files` | Don't export chats. Revisit exported ones and fetch missing attachments, generated files and Library files |
+| `--rerender` | Don't contact ChatGPT. Rebuild every `conversation.md` from its saved `conversation.json` and download rich-answer images; no browser needed |
+| `--list-projects` | Only fetch Project and custom-GPT names into `export/projects.json` for the viewer, then exit |
+
+`python build_viewer.py [options]`
+
+| Option | What it does |
+|---|---|
+| `--export DIR` | Export folder to read (default `export`) |
+| `--categories FILE` | Category keyword file (default `categories.json`; optional) |
+| `--title TEXT` | Title shown at the top of the viewer |
+
 ## Categories (optional)
 
 ```bash
@@ -195,6 +226,14 @@ re-run; regeneration takes seconds.
   requests too quickly"). The script paces itself (~10–20 s per chat), backs
   off in escalating steps when throttled, and permanently slows down each
   time it happens. A 600-chat archive takes a few hours. Let it run.
+- **For large archives, add `--no-page-load`.** By default the script opens
+  each chat's page in Chrome before fetching it, which makes ChatGPT's own
+  page code send many extra requests that count toward the throttle. With
+  `--no-page-load` the Chrome window stays on one ChatGPT page (it will look
+  idle) and each chat is fetched directly. On a 3,000-chat account this ran
+  about 2½× faster once throttling set in (≈55 vs ≈22 chats/hour, with
+  7–19 chats between throttles instead of 2–4). If a Cloudflare check
+  appears, the script opens the chat page so you can solve it in the window.
 - **It's resumable.** Interrupt any time; re-running skips everything
   already exported and retries failures.
 - **Some old files are gone forever.** OpenAI deletes uploaded file content
@@ -203,6 +242,29 @@ re-run; regeneration takes seconds.
   them is still captured. No export method can recover them. The tool also
   recovers what it can from your account's file Library and from
   code-generated (sandbox) files.
+- **The Library sweep downloads your whole Library by default.** After the
+  chats, every file in the account Library is saved into the folder of the
+  chat it came from, or into `export/_library/` if that chat isn't exported
+  — even on a `--limit 3` test run. Add `--limit-files` to download only
+  files belonging to chats you've exported.
+- **Rich answers (photo cards, places, maps) are converted to plain
+  Markdown.** ChatGPT stores these as layout code; the exporter uses
+  ChatGPT's own Markdown version instead, saves the photos into the chat's
+  `files/` folder (shown inline in the viewer), and turns maps into a list
+  of places with OpenStreetMap links. If you exported chats with an older
+  version and see tags like `<AsyncImage …>`, run
+  `python export_chats.py --rerender` (no browser needed; it rebuilds
+  `conversation.md` from the saved `conversation.json`), then rebuild the
+  viewer.
+- **Projects and custom GPTs appear in the viewer's sidebar.** Each chat
+  records which ChatGPT Project (or custom GPT) it belongs to; the viewer
+  lists them under "Projects" and "Custom GPTs" with chat counts (the number
+  beside each heading is the total chats in that section). Names come
+  from `export/projects.json`, which discovery writes. If the sidebar shows
+  IDs instead of names (e.g. an export made with an older version), run
+  `python export_chats.py --list-projects` (about a minute; no chats are
+  downloaded — not while another export is running, since both use the
+  same browser profile), then rebuild the viewer.
 - **Headless doesn't work.** ChatGPT's bot protection blocks invisible
   browsers; the visible Chrome window is required.
 - **Privacy.** `export/`, `chats.csv`, and `browser_profile/` are
@@ -212,8 +274,10 @@ re-run; regeneration takes seconds.
 ## How it works
 
 Rather than scraping the page or asking for your credentials, the script
-waits for ChatGPT's own frontend to request each conversation's JSON from
-its backend and captures that response. Attachments come through the files
+opens each chat in the logged-in browser and requests the conversation's
+JSON from ChatGPT's backend from inside that page, using the auth headers
+ChatGPT's own frontend uses (with `--no-page-load`, it skips opening the
+chat and makes the same request from the ChatGPT page already open). Attachments come through the files
 API, generated files through the interpreter-download API, and stale
 uploads through the account Library — all using the same session headers
 the page itself uses. This makes the export complete and robust to UI
